@@ -18,12 +18,20 @@ brew install python@3.13 rclone jq unar
 ```sh
 git clone https://github.com/friedmad77/drovie-downloader.git
 cd drovie-downloader
-./putioctl deploy                       # copies everything into ~/Scripts
 cp server_config_template ~/.putio_config
 chmod 600 ~/.putio_config
-$EDITOR ~/.putio_config                 # TMDB_API_KEY, PLEX_TOKEN, the folders
-~/Scripts/drovie-downloader setup-putio # asks for your put.io OAuth token
+$EDITOR ~/.putio_config           # TMDB_API_KEY, PLEX_TOKEN, the folders
+./putioctl deploy                 # copies everything into ~/.local/share/drovie-downloader
+DD=~/.local/share/drovie-downloader
+$DD/drovie-downloader setup-putio # asks for your put.io OAuth token
 ```
+
+`deploy` installs into `~/.local/share/drovie-downloader` (or
+`$XDG_DATA_HOME/drovie-downloader`). To use another folder, set
+`DROVIE_DOWNLOADER_HOME` before running it and keep it set for later
+commands. The examples below call that folder `$DD`. To type
+`drovie-downloader` from anywhere, link it onto your PATH:
+`ln -s $DD/drovie-downloader ~/.local/bin/`.
 
 `setup-putio` creates the rclone remote, checks it, and creates the `Drovie`
 folder on put.io if it isn't there. To stop the binaries cron finds from
@@ -33,15 +41,15 @@ differing from your shell's, pin them in the config:
 Do a trial run with nothing deleted from put.io:
 
 ```sh
-~/Scripts/drovie-downloader config set DELETE_AFTER_DOWNLOAD false
-~/Scripts/drovie-downloader sync -f      # -f follows the log
+$DD/drovie-downloader config set DELETE_AFTER_DOWNLOAD false
+$DD/drovie-downloader sync -f      # -f follows the log
 ```
 
 ## Schedule it
 
 ```sh
 crontab -e
-*/5 * * * * $HOME/Scripts/putio_download_and_delete.sh >/dev/null 2>&1
+*/5 * * * * $HOME/.local/share/drovie-downloader/putio_download_and_delete.sh >/dev/null 2>&1
 ```
 
 `drovie-downloader status` reads the crontab to show the next run. To pause,
@@ -59,7 +67,7 @@ use `drovie-downloader pause`; there's no need to edit the crontab.
   Description=Drovie Downloader status service
 
   [Service]
-  ExecStart=%h/Scripts/putio-statusd --putioctl %h/Scripts/putioctl --script %h/Scripts/putio_download_and_delete.sh
+  ExecStart=%h/.local/share/drovie-downloader/putio-statusd --script %h/.local/share/drovie-downloader/putio_download_and_delete.sh
   Restart=always
 
   [Install]

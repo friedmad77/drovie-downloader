@@ -12,29 +12,32 @@ about what is running or whether syncing is paused.
 
 ## Install
 
-`putioctl` lives beside the processor in `~/Scripts` (the copy cron runs). To
-deploy the current repo version of both:
+`putioctl` lives beside the processor in the **install folder** (the copy cron
+runs). That is `~/.local/share/drovie-downloader` (or
+`$XDG_DATA_HOME/drovie-downloader`) unless `DROVIE_DOWNLOADER_HOME` names
+another; an older install already in the previous default folder is found and
+kept where it is. To deploy the current repo version of both:
 
 ```bash
 ./putioctl deploy
 ```
 
 That copies `putio_download_and_delete.sh`, `putioctl`, `putioctl_tui.py`,
-`putio-statusd` and the `putio/` package into `~/Scripts`, and makes the scripts
+`putio-statusd` and the `putio/` package into the install folder, and makes the scripts
 executable. It never copies `.putio_config` — the repo copy carries
 placeholder API keys, and overwriting the live config with it would break every
 run. It also refuses to deploy while a sync is in progress.
 
-`~/Scripts` usually isn't on `$PATH`, so either call it by path:
+The install folder isn't on `$PATH`, so either call it by path:
 
 ```bash
-~/Scripts/putioctl status
+~/.local/share/drovie-downloader/putioctl status
 ```
 
 or link it once:
 
 ```bash
-ln -s ~/Scripts/putioctl /usr/local/bin/putioctl
+ln -s ~/.local/share/drovie-downloader/putioctl ~/.local/bin/putioctl
 ```
 
 The rest of this document assumes `putioctl` is on your `$PATH`.
@@ -176,6 +179,12 @@ The default command. Shows, in one screen:
 - when the **last run completed**, and how many errors are in the retained log
 - the **cron schedule**, and the next fire time for `*/N * * * *` schedules
 - whether the **media mount** is up and how much **free space** is left
+- where the **status service** Drovie reads (`putio-statusd`) listens, whether it
+  answers `/healthz`, and the address to put in Drovie's *Drovie Downloader
+  status address* field. The listening address comes from `STATUSD_BIND` /
+  `STATUSD_PORT` when set (the container sets them), else from the installed
+  launchd plist, else `127.0.0.1:9494`. It is not in `--json`, because
+  `putio-statusd` serves that JSON
 - which script, config and log file it is talking to
 
 ```
@@ -191,7 +200,14 @@ put.io sync status
               next run 2026-08-14 3:55 PM (in 3m 43s)
   Mount       /Volumes/Media mounted
   Free space  991Gi available at /Volumes/Media/Put.io Downloads
+  Status API  127.0.0.1:9494 answering
+  For Drovie  http://host.docker.internal:9494 (Drovie in Docker)
+              http://127.0.0.1:9494 (Drovie run directly)
 ```
+
+On a Mac, Drovie tries exactly those two addresses on its own when its status
+address field is blank, so it only needs filling in for a non-default port or a
+Downloader on another machine.
 
 ### `sync` — run one now
 
@@ -384,12 +400,12 @@ you've set `PUTIOCTL_NO_TUI=1`. Alias: `console`.
 
 ```bash
 putioctl deploy            # from the repo checkout
-putioctl deploy ~/Code/putio-plex-processor    # or name the source explicitly
+putioctl deploy ~/src/drovie-downloader    # or name the source explicitly
 ```
 
 Copies `putio_download_and_delete.sh`, `putioctl`, `putioctl_tui.py`,
 `putio-statusd` and the `putio/` package from the
-repo to `~/Scripts`. The source is the path you give it, otherwise the current
+repo to the install folder. The source is the path you give it, otherwise the current
 directory when it holds the scripts, otherwise the directory `putioctl` itself
 lives in — so it works from the repo even when `putioctl` is on `$PATH` via the
 symlink above. Installs via a temp file and a rename rather than overwriting in
@@ -407,7 +423,7 @@ importing a module you deleted.
 The recorded API responses under `putio/tests/fixtures/` ship with the modules
 and are pruned the same way. They are not an optional extra: the suite lives
 inside the package so it can be run against the deployed tree, and a deploy that
-left the fixtures behind would have those tests error at `~/Scripts` while
+left the fixtures behind would have those tests error in the install folder while
 passing in the checkout — which is precisely the difference the suite exists to
 detect.
 
@@ -454,8 +470,8 @@ Setting `PUTIO_IGNORE_PAUSE=1` bypasses the gate for a single run — that's wha
 
 ## Which copy am I controlling?
 
-By default `putioctl` targets the **deployed** script at
-`~/Scripts/putio_download_and_delete.sh`, because that's the one cron runs and
+By default `putioctl` targets the **deployed** script,
+`putio_download_and_delete.sh` in the install folder, because that's the one cron runs and
 therefore the one whose config, lock and log describe the live sync. It then
 finds the config the same way the script does: `.putio_config` beside the
 script, falling back to `~/.putio_config`.
@@ -474,14 +490,16 @@ what you're pointed at.
 
 ## Files and state
 
+`<install>` is the install folder described under [Install](#install).
+
 | Path | What it is |
 | --- | --- |
-| `~/Scripts/putio_download_and_delete.sh` | The processor cron runs |
-| `~/Scripts/putioctl`, `putioctl_tui.py` | The CLI and its interactive console |
-| `~/Scripts/putio/` | Python package the processor calls into; carries its own tests |
-| `~/Scripts/.putio_config` | Live configuration (API keys, paths, tuning) |
-| `~/Scripts/.putio_config.bak` | Automatic backup from the last config change |
-| `~/Scripts/putio_download_and_delete.log` | Processor log, rotated to 24 hours |
+| `<install>/putio_download_and_delete.sh` | The processor cron runs |
+| `<install>/putioctl`, `putioctl_tui.py` | The CLI and its interactive console |
+| `<install>/putio/` | Python package the processor calls into; carries its own tests |
+| `<install>/.putio_config` | Live configuration (API keys, paths, tuning) |
+| `<install>/.putio_config.bak` | Automatic backup from the last config change |
+| `<install>/putio_download_and_delete.log` | Processor log, rotated to 24 hours |
 | `/tmp/putio_download_and_delete.lock` | Held for the duration of a run; contains the PID |
 | `~/.putio_paused` | Pause marker (absent = not paused) |
 | `/tmp/putio_manual_run.log` | stdout/stderr of a run started by `putioctl sync` |
@@ -518,8 +536,8 @@ already in progress keeps the old ones. Confirm with `putioctl config get KEY`
 that it landed in the file `putioctl config path` reports — editing the repo's
 `.putio_config` does not affect the deployed script.
 
-**Recovering a bad config.** `cp ~/Scripts/.putio_config.bak
-~/Scripts/.putio_config`. `config set` and `config edit` refuse to leave invalid
+**Recovering a bad config.** `cp <install>/.putio_config.bak
+<install>/.putio_config`. `config set` and `config edit` refuse to leave invalid
 bash behind, but the backup is there for a change that was valid and wrong.
 
 **Everything is off the rails.** The pause marker and the lockfile are the only
@@ -572,15 +590,12 @@ files at all.
 
 ### Installing it
 
-launchd expands neither `~` nor `$HOME`, so the shipped plist carries a
-`__HOME__` placeholder that gets substituted on the way in:
+launchd expands neither `~` nor `$HOME`, so the shipped plist carries an
+`__INSTALL_DIR__` placeholder that has to be filled in on the way in. From the
+repo folder:
 
 ```bash
-sed "s|__HOME__|$HOME|g" app.drovie.downloader.statusd.plist > ~/Library/LaunchAgents/app.drovie.downloader.statusd.plist
-```
-
-```bash
-launchctl bootstrap gui/$UID ~/Library/LaunchAgents/app.drovie.downloader.statusd.plist
+putioctl statusd reinstall
 ```
 
 Check it came up:
@@ -605,11 +620,11 @@ the daemon comes back with the old configuration — and reports success. Use:
 putioctl statusd reinstall
 ```
 
-which substitutes `__HOME__`, installs the plist, unloads the running job,
+which fills in `__INSTALL_DIR__`, installs the plist, unloads the running job,
 waits for launchd to finish tearing it down, bootstraps the new one and checks
 that it answers.
 
-The plist is the one deployable that does not live in `~/Scripts`, so
+The plist is the one deployable that does not live in the install folder, so
 `putioctl deploy` never installs it — applying a plist means taking the status
 API down, which should be a decision rather than a side effect of copying
 scripts. Deploy does compare the two and warns when they have drifted, so a
@@ -642,7 +657,7 @@ To remove it entirely:
 launchctl bootout gui/$UID/app.drovie.downloader.statusd && rm ~/Library/LaunchAgents/app.drovie.downloader.statusd.plist
 ```
 
-Its own log is `~/Scripts/putio-statusd.log`. It is a pure reader — if it dies,
+Its own log is `<install>/putio-statusd.log`. It is a pure reader — if it dies,
 or you never install it, the sync is completely unaffected.
 
 Integrating something with it? `STATUS_API.md` is the consumer-facing reference:

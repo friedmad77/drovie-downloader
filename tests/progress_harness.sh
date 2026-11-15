@@ -5,7 +5,7 @@
 # webhook or the live log.
 #
 #   tests/progress_harness.sh                    # the repo copy
-#   tests/progress_harness.sh ~/Scripts/putio_download_and_delete.sh
+#   tests/progress_harness.sh ~/.local/share/drovie-downloader/putio_download_and_delete.sh
 #
 # Since phase 5 the processor is a shim that execs into `python3 -m putio run`,
 # so this harness drives it two ways:
@@ -1605,6 +1605,25 @@ FAKEEOF
         check $? "/transfers answers"
         [ "$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$PORT/nope")" = "404" ]
         check $? "an unknown path is a 404, not a stack trace"
+
+        # `putioctl status` names the address and says whether it answers.
+        # STATUSD_PORT wins over the installed plist, so this never probes the
+        # real daemon on a machine that has one.
+        if [ -x "${CLI:-}" ]; then
+            OUT=$(STATUSD_PORT="$PORT" "$CLI" --script "$SCRIPT_UNDER_TEST" status 2>&1)
+            grep -q "Status API  127.0.0.1:$PORT answering" <<<"$OUT"
+            check $? "putioctl status reports the status service answering"
+            grep -q "For Drovie  http" <<<"$OUT"
+            check $? "putioctl status gives the address to set in Drovie"
+            OUT=$(STATUSD_PORT=$((PORT + 1)) "$CLI" --script "$SCRIPT_UNDER_TEST" status 2>&1)
+            grep -q "Status API  127.0.0.1:$((PORT + 1)) NOT answering" <<<"$OUT"
+            check $? "putioctl status reports a status service that is down"
+            OUT=$(DROVIE_DOWNLOADER_CONTAINER=1 STATUSD_BIND=0.0.0.0 STATUSD_PORT="$PORT" \
+                "$CLI" --script "$SCRIPT_UNDER_TEST" status 2>&1)
+            grep -q "Status API  0.0.0.0:$PORT answering" <<<"$OUT" &&
+                grep -q "http://downloader:$PORT" <<<"$OUT"
+            check $? "in the container it probes a wildcard bind on loopback and names the compose service"
+        fi
 
         # The whole point: wedge the source and the endpoint must stay fast.
         touch "$WORKDIR/wedge"

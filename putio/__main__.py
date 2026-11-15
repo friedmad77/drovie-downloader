@@ -110,7 +110,7 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
     """Prove the scaffolding is intact: interpreter, import path, handoff.
 
     Written to be run against a *deployed* tree, not just the checkout.  It is
-    the only thing that can tell you the copy under ~/Scripts is the one that
+    the only thing that can tell you the copy in the install folder is the one that
     works, which matters because ``putioctl deploy`` replaces files one at a
     time and cron never reports an ImportError to anyone.
     """

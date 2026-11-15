@@ -13,7 +13,8 @@ drovie-downloader config list     # the settings it actually sees
 
 - **Wrong folder.** The Downloader only looks in `REMOTE` (default
   `putio:Drovie/`). Check that Drovie sends transfers there: in Drovie, open
-  Settings › Download client › put.io and press **Use a Drovie folder**.
+  Settings › Download client › put.io, press **Choose folder** and pick (or
+  create) the `Drovie` folder at the top level, then save.
   Transfers already finished in another folder won't be picked up; move them
   into `Drovie` on put.io.
 - **Paused.** `status` says so. Run `drovie-downloader resume`.
@@ -50,8 +51,9 @@ cause, and put.io keeps its copy until a later run can file them.
 
 ## Drovie says it can't reach Drovie Downloader
 
-In Drovie, open Settings › Download client › put.io and press **Test status
-address**. The message names the address it tried.
+In Drovie, open Settings › Download client and look at the **Drovie
+Downloader** card. It says **Not connected** with the address it tried; fix the
+address and press **Test connection**.
 
 - **Same compose file:** the address is `http://downloader:9494`. Check that
   the `downloader` profile is running (`docker compose ps`).

@@ -69,11 +69,14 @@ You need Drovie's `docker-compose.yml` running, plus:
    docker compose logs -f downloader
    ```
 
-4. In Drovie, open **Settings › Download client › put.io** and press
-   **Use a Drovie folder**. This creates a `Drovie` folder on put.io and sends
-   new downloads there, which is the folder Drovie Downloader watches. Then
-   press **Test status address**. It should answer "Connected. Drovie
-   Downloader is idle."
+4. In Drovie, open **Settings › Download client**:
+   - On the **put.io** card, press **Choose folder** next to "put.io download
+     folder". Pick the `Drovie` folder, or press **Create folder here** at the
+     top level (the name is filled in for you), then **Use this folder** and
+     save. That is the folder Drovie Downloader watches.
+   - The **Drovie Downloader** card checks the Downloader when the page opens
+     and shows **Connected · idle** when it can reach it. **Test connection**
+     checks again.
 
 5. Optional: copy Drovie's webhook key (**Settings › Plex › Instant updates**)
    into `downloader.env` as `DROVIE_WEBHOOK_KEY`, then
@@ -94,7 +97,7 @@ docker compose up -d
 ```
 
 To let a Drovie on another machine read its status, uncomment the `ports`
-lines and set Drovie's **Drovie Downloader status address** to
+lines and set the **Status address** on Drovie's **Drovie Downloader** card to
 `http://<this-machine>:9494`. The status service has no login of its own, so
 only publish it on a network you trust.
 

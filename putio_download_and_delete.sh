@@ -153,6 +153,9 @@ fi
 
 source "$CONFIG_FILE"
 
+# The log sits beside the processor unless the config says otherwise.
+LOG_FILE="${LOG_FILE:-$SCRIPT_DIR/putio_download_and_delete.log}"
+
 # The Drovie webhook was PLEX_REQUEST_WEBHOOK_URL/_KEY before the rename. The
 # old names stay as aliases so an existing config keeps notifying Drovie; the
 # new name wins when both are set.
@@ -276,7 +279,7 @@ MAX_REQUESTS_PER_WINDOW RATE_WINDOW_SECONDS RATE_LIMIT_DELAY
 # readable as a working directory. (`-P` would say this outright, but it needs
 # Python 3.11 and Apple's 3.9 is still a possible interpreter here.)
 #
-# -B keeps a __pycache__ out of ~/Scripts: the deployed tree is replaced file by
+# -B keeps a __pycache__ out of the install folder: the deployed tree is replaced file by
 # file, and a stale .pyc beside a swapped .py silently shadows it — which is not
 # hypothetical, it happened while this function was being written.
 #

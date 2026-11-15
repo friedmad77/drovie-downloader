@@ -281,7 +281,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="Read-only HTTP status for Drovie Downloader (the put.io downloader).",
     )
-    ap.add_argument("--putioctl", default=os.path.expanduser("~/Scripts/putioctl"),
+    # putioctl is deployed beside this daemon, so that is the default.
+    ap.add_argument("--putioctl",
+                    default=os.path.join(os.path.dirname(os.path.realpath(__file__)), "putioctl"),
                     help="path to putioctl (default: %(default)s)")
     ap.add_argument("--script", default=None,
                     help="processor path to pass through as --script, so the daemon "

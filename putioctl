@@ -62,7 +62,26 @@ SELF_DIR="$(resolve_self_dir)"
 # scripts and the console keep working.
 PROG="$(basename "${BASH_SOURCE[0]}")"
 case "$PROG" in putioctl|drovie-downloader) ;; *) PROG=drovie-downloader ;; esac
-DEPLOYED_SCRIPT="$HOME/Scripts/putio_download_and_delete.sh"
+# Where `deploy` installs and where the CLI finds the live copy that cron runs.
+# DROVIE_DOWNLOADER_HOME wins; otherwise ${XDG_DATA_HOME:-~/.local/share}/drovie-downloader.
+# Installs from before that default existed live in the legacy folder below and
+# keep working there: if the old folder holds a processor and the new one does not, it is
+# used. The line is tagged so the public snapshot check allows exactly it.
+resolve_install_dir() {
+    if [ -n "${DROVIE_DOWNLOADER_HOME:-}" ]; then
+        printf '%s' "${DROVIE_DOWNLOADER_HOME%/}"
+        return
+    fi
+    local xdg="${XDG_DATA_HOME:-$HOME/.local/share}/drovie-downloader"
+    local legacy="$HOME/Scripts" # legacy-install-dir
+    if [ ! -f "$xdg/putio_download_and_delete.sh" ] && [ -f "$legacy/putio_download_and_delete.sh" ]; then
+        printf '%s' "$legacy"
+        return
+    fi
+    printf '%s' "$xdg"
+}
+INSTALL_DIR="$(resolve_install_dir)"
+DEPLOYED_SCRIPT="$INSTALL_DIR/putio_download_and_delete.sh"
 
 SCRIPT_PATH="${PUTIO_SCRIPT:-}"
 CONFIG_PATH="${PUTIO_CONFIG:-}"
@@ -104,7 +123,7 @@ load_config() {
     # shellcheck disable=SC1090
     source "$CONFIG_PATH" || die "Failed to read config: $CONFIG_PATH"
 
-    LOG_FILE="${LOG_FILE:-$HOME/Scripts/putio_download_and_delete.log}"
+    LOG_FILE="${LOG_FILE:-$(dirname "$SCRIPT_PATH")/putio_download_and_delete.log}"
     # Display-only setting: the processor never reads it, but it lives in the
     # same config so the preference follows the log it applies to and shows up
     # in `config list` like everything else.
@@ -501,6 +520,9 @@ cmd_status() {
         [ -n "$free" ] && printf '  Free space  %s available at %s\n' "$free" "$LOCAL_DIR"
     fi
 
+    # --- status service ---
+    status_statusd
+
     printf '\n  %sscript%s  %s\n  %sconfig%s  %s\n  %slog%s     %s\n' \
         "$C_DIM" "$C_RESET" "$SCRIPT_PATH" \
         "$C_DIM" "$C_RESET" "$CONFIG_PATH" \
@@ -716,7 +738,7 @@ statusd_loaded() {
     launchctl print "$STATUSD_DOMAIN/$STATUSD_LABEL" >/dev/null 2>&1
 }
 
-# The plist is the one deployable that does NOT live in ~/Scripts, so
+# The plist is the one deployable that does NOT live in the install folder, so
 # `putioctl deploy` never installs it and drift is silent — the installed copy
 # can lag the repo indefinitely with everything looking healthy. This answers
 # whether it has:
@@ -725,8 +747,107 @@ statusd_plist_state() {
     local src="$1"
     [ -f "$src" ] || return 3
     [ -f "$STATUSD_PLIST" ] || return 2
-    [ "$(sed "s|__HOME__|$HOME|g" "$src")" = "$(cat "$STATUSD_PLIST")" ] || return 1
+    [ "$(sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" -e "s|__HOME__|$HOME|g" "$src")" = "$(cat "$STATUSD_PLIST")" ] || return 1
     return 0
+}
+
+# Where putio-statusd listens, as "BIND PORT". In order:
+#   STATUSD_BIND/STATUSD_PORT — what the container image sets, and an explicit
+#     override anywhere else;
+#   the installed launchd plist — the host install configures the port there
+#     (and the bind, should anyone add --bind to it);
+#   putio-statusd's own defaults, 127.0.0.1:9494.
+statusd_endpoint() {
+    local bind="${STATUSD_BIND:-}" port="${STATUSD_PORT:-}"
+    if [ "${DROVIE_DOWNLOADER_CONTAINER:-}" != "1" ] && [ -f "$STATUSD_PLIST" ]; then
+        [ -n "$port" ] || port=$(statusd_plist_arg --port "$STATUSD_PLIST")
+        [ -n "$bind" ] || bind=$(statusd_plist_arg --bind "$STATUSD_PLIST")
+    fi
+    case "$port" in ''|*[!0-9]*) port=9494 ;; esac
+    [ -n "$bind" ] || bind=127.0.0.1
+    printf '%s %s' "$bind" "$port"
+}
+
+# The <string> after a given flag in a plist's ProgramArguments, or nothing.
+statusd_plist_arg() {
+    awk -v flag="<string>$1</string>" 'index($0, flag) { getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit }' "$2"
+}
+
+# http://HOST:PORT, bracketing an IPv6 literal.
+statusd_url() {
+    case "$1" in
+        *:*) local h="${1#[}"; printf 'http://[%s]:%s' "${h%]}" "$2" ;;
+        *) printf 'http://%s:%s' "$1" "$2" ;;
+    esac
+}
+
+# Is anything answering BASE_URL/healthz? 0 yes, 1 no, 2 cannot tell (no
+# curl). Kept to a one-second budget: `status` is interactive, and the console
+# runs it on demand.
+statusd_answering() {
+    command -v curl >/dev/null 2>&1 || return 2
+    curl -fsS --max-time 1 "$1/healthz" >/dev/null 2>&1
+}
+
+# The "Status API" block of `status`: where the service Drovie reads listens,
+# whether it answers, and the address to give Drovie. Deliberately not part of
+# --json: putio-statusd serves that JSON, so it would be the daemon reporting
+# on itself every refresh.
+status_statusd() {
+    local ep bind port probe url state
+    ep=$(statusd_endpoint); bind=${ep% *}; port=${ep#* }
+    # A wildcard bind is reached on loopback from here.
+    case "$bind" in 0.0.0.0|::|'[::]') probe=127.0.0.1 ;; *) probe=$bind ;; esac
+    case "$bind" in *:*) url="[${bind#[}"; url="${url%]}]:$port" ;; *) url="$bind:$port" ;; esac
+
+    statusd_answering "$(statusd_url "$probe" "$port")"; state=$?
+    case $state in
+        0) printf '  Status API  %s %sanswering%s\n' "$url" "$C_GREEN" "$C_RESET" ;;
+        2) printf '  Status API  %s %s(curl not found — cannot check)%s\n' "$url" "$C_YELLOW" "$C_RESET" ;;
+        *)
+            printf '  Status API  %s %sNOT answering%s\n' "$url" "$C_RED" "$C_RESET"
+            if [ "${DROVIE_DOWNLOADER_CONTAINER:-}" = "1" ]; then
+                printf '              %sthe container starts it; check docker logs for "Status service"%s\n' "$C_DIM" "$C_RESET"
+            elif [ "$(uname -s)" = "Darwin" ]; then
+                if [ -f "$STATUSD_PLIST" ]; then
+                    printf '              %srestart it: launchctl kickstart -k %s/%s%s\n' \
+                        "$C_DIM" "$STATUSD_DOMAIN" "$STATUSD_LABEL" "$C_RESET"
+                else
+                    printf '              %snot installed — %s statusd reinstall%s\n' "$C_DIM" "$PROG" "$C_RESET"
+                fi
+            fi
+            ;;
+    esac
+
+    # The address to type into Drovie's "Drovie Downloader status address".
+    # The host-side answers match where Drovie looks on its own when that field
+    # is blank (Drovie processorStatusClient.ts): host.docker.internal
+    # from inside a container, 127.0.0.1 otherwise, on 9494.
+    local L
+    L=$(printf '  %sFor Drovie%s  ' "$C_DIM" "$C_RESET")
+    if [ "${DROVIE_DOWNLOADER_CONTAINER:-}" = "1" ]; then
+        case "$bind" in
+            127.*|::1|localhost)
+                printf '%s%sunreachable from another container — set STATUSD_BIND=0.0.0.0%s\n' \
+                    "$L" "$C_YELLOW" "$C_RESET" ;;
+            *)  printf '%shttp://downloader:%s %s(or whatever this compose service is named)%s\n' \
+                    "$L" "$port" "$C_DIM" "$C_RESET" ;;
+        esac
+        return 0
+    fi
+    case "$bind" in
+        127.*|::1|localhost)
+            if [ "$(uname -s)" = "Darwin" ]; then
+                printf '%shttp://host.docker.internal:%s %s(Drovie in Docker)%s\n' "$L" "$port" "$C_DIM" "$C_RESET"
+                printf '              %s %s(Drovie run directly)%s\n' "$(statusd_url "$bind" "$port")" "$C_DIM" "$C_RESET"
+            else
+                printf '%s%s %s(not reachable from Docker on Linux)%s\n' \
+                    "$L" "$(statusd_url "$bind" "$port")" "$C_DIM" "$C_RESET"
+            fi
+            ;;
+        *)  printf '%shttp://<this machine>:%s %s(no login — trusted networks only)%s\n' \
+                "$L" "$port" "$C_DIM" "$C_RESET" ;;
+    esac
 }
 
 require_jq_json() {
@@ -1544,7 +1665,8 @@ idle_line_count() {
 # ---------------------------------------------------------------------------
 # deploy
 #
-# Copies the processor and this CLI from the repo to ~/Scripts, which is what
+# Copies the processor and this CLI from the repo to the install folder
+# ($INSTALL_DIR, see resolve_install_dir), which is what
 # cron runs. The config is never copied: the repo copy carries placeholder API
 # keys, and overwriting the deployed one with it would break every run.
 # ---------------------------------------------------------------------------
@@ -1570,7 +1692,7 @@ install_atomic() {
 # +x .py in a deployed tree invites someone to run it with the wrong python.
 #
 # Stale .py and .pyc files are pruned afterwards: a module deleted from the
-# repo would otherwise sit in ~/Scripts forever, and Python would happily keep
+# repo would otherwise sit in the install folder forever, and Python would happily keep
 # importing it. -B on the processor's side stops new bytecode appearing, but a
 # .pyc written by an interactive run before that flag existed still has to go.
 #
@@ -1588,7 +1710,7 @@ INSTALLED_MODULES=0
 # The fixtures are not an optional extra. The suite ships inside the package
 # precisely so it can be run against the *deployed* tree — that is the only way
 # to confirm the copy cron uses is the copy that works — and a deploy that left
-# them behind would turn every phase 2 test into an error at ~/Scripts while
+# them behind would turn every phase 2 test into an error in the install folder while
 # passing in the checkout. Both loops below use this, so a fixture deleted
 # upstream is also removed downstream rather than lingering.
 package_files() {
@@ -1620,7 +1742,7 @@ install_package() {
 cmd_deploy() {
     case "${1:-}" in -h|--help) usage_deploy; return 0 ;; esac
 
-    local dest_dir="$HOME/Scripts"
+    local dest_dir="$INSTALL_DIR"
 
     # Source is an explicit path, else the working directory when it looks like
     # the checkout, else wherever this script lives. The middle case is what
@@ -1829,7 +1951,7 @@ statusd_reinstall() {
     # working copy is still in place.
     local tmp
     tmp=$(mktemp "$STATUSD_PLIST.XXXXXX") || die "Cannot write beside $STATUSD_PLIST"
-    sed "s|__HOME__|$HOME|g" "$src" > "$tmp" || { rm -f "$tmp"; die "Failed to write $tmp"; }
+    sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" -e "s|__HOME__|$HOME|g" "$src" > "$tmp" || { rm -f "$tmp"; die "Failed to write $tmp"; }
     plutil -lint "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "Generated plist is not valid — left $src unchanged."; }
     mv "$tmp" "$STATUSD_PLIST" || { rm -f "$tmp"; die "Failed to install $STATUSD_PLIST"; }
     ok "Installed $STATUSD_PLIST"
@@ -1880,7 +2002,7 @@ statusd_reinstall() {
     # the job, not that the daemon bound its port and can answer — a bad
     # PYTHON_BIN or a taken port shows up only here.
     local port
-    port=$(awk '/<string>--port<\/string>/ { getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit }' "$STATUSD_PLIST")
+    port=$(statusd_plist_arg --port "$STATUSD_PLIST")
     case "${port:-}" in ''|*[!0-9]*) port=9494 ;; esac
 
     command -v curl >/dev/null 2>&1 || { warn "curl not found — skipping the health check."; return 0; }
@@ -1894,7 +2016,7 @@ statusd_reinstall() {
         sleep 0.1
     done
     warn "Bootstrapped, but nothing answered on 127.0.0.1:$port within 5s."
-    info "  ${C_DIM}Check $HOME/Scripts/putio-statusd.log${C_RESET}"
+    info "  ${C_DIM}Check $INSTALL_DIR/putio-statusd.log${C_RESET}"
     return 1
 }
 
@@ -1921,15 +2043,15 @@ ${C_BOLD}COMMANDS${C_RESET}
   config <sub>           list | get KEY | set KEY VALUE | unset KEY | edit | path
   logs [-n N] [-f]       Show the processor log (--errors for problems only)
   quiet [on|off]         Toggle hiding the idle "nothing to do" runs in the log
-  deploy                 Copy the repo scripts to ~/Scripts (never the config)
+  deploy                 Copy the repo scripts to $INSTALL_DIR (never the config)
   statusd <sub>          reinstall — install the launchd plist and restart the daemon
   setup-putio [TOKEN]    Connect your put.io account (creates the rclone remote)
   version                Print the $PROG version
 
 ${C_BOLD}GLOBAL OPTIONS${C_RESET}
-  --script PATH          Processor script to control (default: ~/Scripts copy)
+  --script PATH          Processor script to control (default: the copy in $INSTALL_DIR)
   --config PATH          Config file to read/edit (default: beside the script)
-  --repo                 Act on the repo copy beside $PROG instead of ~/Scripts
+  --repo                 Act on the repo copy beside $PROG instead of $INSTALL_DIR
 
 ${C_BOLD}EXAMPLES${C_RESET}
   $PROG                              # interactive console
@@ -2131,10 +2253,11 @@ EOF
 
 usage_deploy() {
     cat <<EOF
-$PROG deploy [PATH] — copy the scripts to ~/Scripts
+$PROG deploy [PATH] — copy the scripts to the install folder
 
 Copies putio_download_and_delete.sh, putioctl and putioctl_tui.py into
-~/Scripts (the location cron runs) and makes them executable. The config is
+$INSTALL_DIR (the location cron runs; set DROVIE_DOWNLOADER_HOME to
+choose another) and makes them executable. The config is
 deliberately not copied. Refuses to run while a sync is in progress.
 
 Source is PATH if given, otherwise the current directory when it holds the
