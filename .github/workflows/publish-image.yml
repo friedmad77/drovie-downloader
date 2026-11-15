@@ -1,0 +1,90 @@
+name: Publish image
+
+# Builds the Drovie Downloader image (root Dockerfile) for linux/amd64 and
+# linux/arm64 and publishes it as ghcr.io/<owner>/drovie-downloader.
+#
+# Publishing happens only in the public repository (named
+# "drovie-downloader"). Anywhere else, including the private development repo
+# and pull requests, the same build runs without pushing, so a broken image
+# shows up before a release does.
+#
+# Tags:
+#   push to main  → edge, sha-<short>
+#   tag vX.Y.Z    → X.Y.Z, X.Y, latest (latest only for non-prerelease tags)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Multi-arch image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUBLISH: ${{ github.event.repository.name == 'drovie-downloader' && github.event_name != 'pull_request' }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # The image installs only apt packages and copies rclone from its own
+      # image, so an emulated arm64 build takes a few minutes.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image name
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/drovie-downloader" >> "$GITHUB_OUTPUT"
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=edge,branch=main
+            type=sha,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          flavor: |
+            latest=auto
+          labels: |
+            org.opencontainers.image.title=Drovie Downloader
+            org.opencontainers.image.description=Copies finished put.io downloads into your Plex library
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - name: Build (and push when publishing)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test (amd64)
+        if: env.PUBLISH != 'true'
+        run: |
+          docker buildx build --load --platform linux/amd64 -t dd-smoke . >/dev/null
+          docker run --rm -e TMDB_API_KEY=x -e PLEX_TOKEN=y -e REMOTE=/tmp/none dd-smoke --version

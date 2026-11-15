@@ -1,0 +1,7 @@
+.putio_config
+.putio_config.bak
+.testhome/
+
+# Python bytecode — putio_python passes -B, but an interactive run still writes it.
+__pycache__/
+*.pyc

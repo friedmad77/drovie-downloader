@@ -1,0 +1,47 @@
+#!/bin/bash
+#
+# launchd shim for putio-statusd.
+#
+# launchd takes a literal path in ProgramArguments and can neither read the
+# config nor expand a variable, so a plist naming the interpreter directly
+# would carry a second, hardcoded answer to "which python" — free to drift from
+# the PYTHON_BIN the processor uses. That is precisely how cron ended up
+# running rclone v1.70.2 and Apple's jq while an interactive shell got the
+# Homebrew builds, unnoticed for months. One source of truth instead: the
+# config decides, and this resolves it at launch.
+#
+# Everything after the script name is passed through, so the plist stays the
+# place where ports and intervals are configured.
+
+set -uo pipefail
+
+SELF_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Same discovery order as the processor: beside the script, then the home copy.
+for cfg in "$SELF_DIR/.putio_config" "$HOME/.putio_config"; do
+    if [ -f "$cfg" ]; then
+        # shellcheck disable=SC1090
+        . "$cfg"
+        break
+    fi
+done
+
+# Apple's python3 is the fallback rather than a hard failure. It is frozen at
+# 3.9.6 and past upstream EOL, but the daemon is stdlib-only and runs fine on
+# it — and a status endpoint that refuses to start because a pin is wrong is
+# worse than one running on the older interpreter, since KeepAlive would
+# otherwise relaunch it every ThrottleInterval forever.
+PY="${PYTHON_BIN:-}"
+if [ -n "$PY" ] && [ ! -x "$PY" ]; then
+    echo "[statusd-run] PYTHON_BIN=$PY is not executable — falling back to /usr/bin/python3" >&2
+    PY=""
+fi
+[ -n "$PY" ] || PY=/usr/bin/python3
+
+if [ ! -x "$PY" ]; then
+    echo "[statusd-run] no usable python: neither PYTHON_BIN nor /usr/bin/python3" >&2
+    exit 1
+fi
+
+# exec, so launchd keeps tracking this pid rather than a child it cannot see.
+exec "$PY" "$SELF_DIR/putio-statusd" "$@"

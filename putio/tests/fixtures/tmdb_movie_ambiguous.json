@@ -1,0 +1,70 @@
+{
+  "page": 1,
+  "results": [
+    {
+      "adult": false,
+      "backdrop_path": "/zeCuk7kwfhzRZMN2KoYTYODgpU3.jpg",
+      "genre_ids": [
+        53,
+        18,
+        9648
+      ],
+      "id": 1381027,
+      "title": "Good Boy",
+      "original_language": "en",
+      "original_title": "Good Boy",
+      "overview": "Tommy, a volatile 19-year-old, revels in drugs, parties and violence. After getting separated from his friends on a drunken bender, he is abducted by a shadowy figure. He wakes to find himself imprisoned in the basement of a remote Yorkshire house, inhabited by a very strange family. But what unfolds is not what he could possibly expect.",
+      "popularity": 17.3159,
+      "poster_path": "/eWb841fMkSNly5gfL9J1N0xzVYI.jpg",
+      "release_date": "2026-03-05",
+      "softcore": false,
+      "video": false,
+      "vote_average": 7.306,
+      "vote_count": 247
+    },
+    {
+      "adult": false,
+      "backdrop_path": null,
+      "genre_ids": [
+        53,
+        35,
+        18
+      ],
+      "id": 1539911,
+      "title": "THE DELIVERYBOY",
+      "original_language": "en",
+      "original_title": "THE DELIVERYBOY",
+      "overview": "A brooding stoner returns to his suburban Massachusetts hometown for the first time since his brother's death and becomes entangled in a cat and mouse game with an enigmatic middle school acquaintance in this darkly comedic erotic thriller.",
+      "popularity": 1.5921,
+      "poster_path": "/jBEqYSc9lfag49PwcxR345zY9ji.jpg",
+      "release_date": "2025-10-04",
+      "softcore": false,
+      "video": false,
+      "vote_average": 0.0,
+      "vote_count": 0
+    },
+    {
+      "adult": false,
+      "backdrop_path": "/gxSVZCUlDd8upT1G2wdrUdz2hxG.jpg",
+      "genre_ids": [
+        28,
+        80,
+        35
+      ],
+      "id": 8961,
+      "title": "Bad Boys II",
+      "original_language": "en",
+      "original_title": "Bad Boys II",
+      "overview": "Detectives Marcus Burnett and Mike Lowrey of the Miami Narcotics Task Force are tasked with stopping the flow of the drug Ecstasy into Miami. They track the drugs to the whacked-out Cuban drug lord Johnny Tapia, who is also involved in a bloody war with Russian and Haitian mobsters. If that isn't bad enough, there's tension between the two detectives when Marcus discovers that playboy Mike is secretly romancing Marcus’ sister, Syd.",
+      "popularity": 11.7052,
+      "poster_path": "/yCvB5fG5aEPqa1St7ihY6KEAsHD.jpg",
+      "release_date": "2003-07-18",
+      "softcore": false,
+      "video": false,
+      "vote_average": 6.656,
+      "vote_count": 6075
+    }
+  ],
+  "total_pages": 1,
+  "total_results": 3
+}
