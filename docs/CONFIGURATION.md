@@ -28,7 +28,7 @@ valid bash.
 
 | Setting | Default | Notes |
 |---|---|---|
-| `REMOTE` | `putio:Drovie/` | The rclone remote and folder to download from. Keep it the same as Drovie's put.io download folder ("Use a Drovie folder" in Drovie sets that to `Drovie`). **`putio:` on its own means your whole account**, and every file in it will be downloaded and then deleted. |
+| `REMOTE` | `putio:Drovie/` | The rclone remote and folder to download from. Keep it the same as Drovie's put.io download folder (pick the `Drovie` folder with **Choose folder** on Drovie's put.io card). **`putio:` on its own means your whole account**, and every file in it will be downloaded and then deleted. |
 | `DELETE_AFTER_DOWNLOAD` | `true` | Set to `false` to keep files on put.io, for example during a trial run. Junk (samples, ads, files under 1 MB) is removed either way. |
 | `PUTIO_TOKEN` | | Docker only. Read once at container start to write `/config/rclone.conf`, then dropped from the environment. |
 
@@ -59,8 +59,8 @@ valid bash.
 | `DROVIE_WEBHOOK_KEY` | empty | Drovie › Settings › Plex › Instant updates › Webhook key. |
 
 Drovie reads the Downloader's progress from its status service on port 9494.
-In Drovie, the address is set with **Settings › Download client › put.io ›
-Drovie Downloader status address**, or with the `PUTIO_STATUSD_URL`
+In Drovie, the address is set on the **Drovie Downloader** card under
+**Settings › Download client** (**Status address**), or with the `PUTIO_STATUSD_URL`
 environment variable. The saved setting wins.
 
 ## Schedule (Docker)

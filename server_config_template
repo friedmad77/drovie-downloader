@@ -14,8 +14,9 @@ MOVIE_LIBRARY="/srv/media/Movies"
 TV_LIBRARY="/srv/media/TV"
 UNMATCHED_DIR="/srv/media/Unmatched"
 
-# Log file location
-LOG_FILE="$HOME/Scripts/putio_download_and_delete.log"
+# Log file location. Leave unset to keep the log beside the processor
+# (putio_download_and_delete.log in the install folder).
+#LOG_FILE="/path/to/putio_download_and_delete.log"
 
 # Lock file location
 LOCKFILE="/tmp/putio_download_and_delete.lock"

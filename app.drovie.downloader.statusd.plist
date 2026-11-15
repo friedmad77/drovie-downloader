@@ -2,9 +2,10 @@
 <!--
   launchd job for the Drovie Downloader status service (putio-statusd).
 
-  __HOME__ is a placeholder: launchd does not expand ~ or $HOME in these paths.
-  Install with the sed in PUTIOCTL.md rather than editing this copy, so the
-  repo stays machine-independent.
+  __INSTALL_DIR__ is a placeholder for the folder `drovie-downloader deploy`
+  installs into: launchd does not expand ~ or $HOME in these paths. Install
+  with `drovie-downloader statusd reinstall`, which fills it in, rather than
+  editing this copy, so the repo stays machine-independent.
 
   KeepAlive is unconditional on purpose. The daemon holds no state, so a
   restart costs nothing and loses nothing — the same reason the processor can
@@ -25,11 +26,11 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__HOME__/Scripts/putio-statusd-run</string>
+        <string>__INSTALL_DIR__/putio-statusd-run</string>
         <string>--putioctl</string>
-        <string>__HOME__/Scripts/putioctl</string>
+        <string>__INSTALL_DIR__/putioctl</string>
         <string>--script</string>
-        <string>__HOME__/Scripts/putio_download_and_delete.sh</string>
+        <string>__INSTALL_DIR__/putio_download_and_delete.sh</string>
         <string>--port</string>
         <string>9494</string>
         <string>--interval</string>
@@ -70,9 +71,9 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>__HOME__/Scripts/putio-statusd.log</string>
+    <string>__INSTALL_DIR__/putio-statusd.log</string>
     <key>StandardErrorPath</key>
-    <string>__HOME__/Scripts/putio-statusd.log</string>
+    <string>__INSTALL_DIR__/putio-statusd.log</string>
 
     <key>ProcessType</key>
     <string>Background</string>

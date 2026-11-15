@@ -33,7 +33,7 @@ RUN ln -s putioctl /app/drovie-downloader \
  && rm -rf /app/putio/tests
 
 # HOME=/config puts the config, pause marker and rclone.conf on the volume.
-# PUTIO_SCRIPT tells putioctl where the processor is (not ~/Scripts here).
+# PUTIO_SCRIPT tells putioctl where the processor is (there is no deploy folder in the image).
 # STATUSD_BIND: Drovie runs in another container, so loopback won't do; the
 # port is only reachable on the compose network unless you publish it.
 ENV DROVIE_DOWNLOADER_CONTAINER=1 \

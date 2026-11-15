@@ -16,7 +16,7 @@ class GateTest(unittest.TestCase):
         config = Config(media_mount_point=mount_point)
         return MountGate(
             config,
-            "/Scripts/putio_download_and_delete.sh",
+            "/opt/drovie-downloader/putio_download_and_delete.sh",
             lambda level, message: self.lines.append((level, message)),
             runner=lambda: status,
         )

@@ -70,7 +70,7 @@ BODY_EXCERPT = 300
 #: Identifies the caller to TMDb and Plex.  urllib's default is
 #: ``Python-urllib/3.x``, which some WAFs in front of a webhook endpoint reject
 #: outright — and the failure looks like the endpoint being down.
-USER_AGENT = "putio-plex-processor/1 (+https://github.com/putio-plex-processor)"
+USER_AGENT = "drovie-downloader/1 (+https://github.com/friedmad77/drovie-downloader)"
 
 #: Query parameters whose values must never reach the log.  Matched
 #: case-insensitively on the name; the value is replaced wholesale rather than
