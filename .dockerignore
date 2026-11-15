@@ -1,0 +1,10 @@
+.git
+.github
+tests
+putio/tests
+**/__pycache__
+*.pyc
+.putio_config
+.putio_config.bak
+.testhome
+CLAUDE.md

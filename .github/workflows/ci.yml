@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    # The official image rather than setup-python: 3.9 is past upstream EOL and
+    # no longer offered for current runners, but it is still what Apple ships.
+    container: python:${{ matrix.python }}-slim
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the oldest interpreter a native macOS install may run on;
+        # 3.13 is what the image ships.
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v5
+      # Two tests shell out: one opens a real zip, one reads a run's elapsed
+      # time with ps. The slim image ships neither.
+      - name: Tools the suite shells out to
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends unzip procps
+      - name: Unit suite (standard library only, no network)
+        run: python -m unittest discover -v
+
+  shell:
+    name: Shell syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: bash -n
+        run: |
+          for f in putio_download_and_delete.sh putioctl docker/entrypoint.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done
+          sh -n docker/cli.sh && echo "ok  docker/cli.sh"

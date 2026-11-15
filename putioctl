@@ -1,0 +1,2203 @@
+#!/usr/bin/env bash
+#
+# putioctl - control CLI for the put.io -> Plex processor
+#
+# Covers the three things worth doing between cron runs: change configuration,
+# start a sync now, and hold the schedule off for a while. Every piece of state
+# it touches (config file, lockfile, pause file, log) is the same state the
+# scheduled script reads, so cron and the CLI can never disagree about what is
+# running or whether syncing is paused.
+#
+# Pausing deliberately does NOT edit the crontab: the schedule stays intact and
+# a pause is one file away from being undone, which also means a half-finished
+# pause can't leave the schedule permanently disabled.
+
+set -uo pipefail
+
+PUTIOCTL_VERSION="1.1.0"
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+if [ -t 1 ]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
+
+info()  { printf '%s\n' "$*"; }
+ok()    { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()  { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()   { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()   { err "$*"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Locating the script and its configuration
+#
+# Default target is the DEPLOYED script, because that is the copy cron runs and
+# therefore the one whose config, lock and log reflect the live sync. Working on
+# the repo copy is opt-in via --repo or PUTIO_SCRIPT.
+# ---------------------------------------------------------------------------
+
+# Resolved through symlinks: the documented install puts a symlink in
+# /usr/local/bin, and an unresolved dirname would make every "beside me" lookup
+# (the console, the deploy source) point at the symlink's directory instead of
+# where the scripts actually live.
+resolve_self_dir() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -L "$src" ]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+    done
+    (cd -P "$(dirname "$src")" && pwd)
+}
+
+SELF_DIR="$(resolve_self_dir)"
+
+# The name this was invoked as, for help and hints: drovie-downloader is the
+# public name and putioctl the original, kept as an alias so existing habits,
+# scripts and the console keep working.
+PROG="$(basename "${BASH_SOURCE[0]}")"
+case "$PROG" in putioctl|drovie-downloader) ;; *) PROG=drovie-downloader ;; esac
+DEPLOYED_SCRIPT="$HOME/Scripts/putio_download_and_delete.sh"
+
+SCRIPT_PATH="${PUTIO_SCRIPT:-}"
+CONFIG_PATH="${PUTIO_CONFIG:-}"
+USE_REPO=0
+
+resolve_paths() {
+    if [ -z "$SCRIPT_PATH" ]; then
+        if [ "$USE_REPO" -eq 1 ]; then
+            SCRIPT_PATH="$SELF_DIR/putio_download_and_delete.sh"
+        elif [ -f "$DEPLOYED_SCRIPT" ]; then
+            SCRIPT_PATH="$DEPLOYED_SCRIPT"
+        else
+            SCRIPT_PATH="$SELF_DIR/putio_download_and_delete.sh"
+        fi
+    fi
+    [ -f "$SCRIPT_PATH" ] || die "Processor script not found: $SCRIPT_PATH (set PUTIO_SCRIPT or use --script)"
+
+    # Mirrors the script's own discovery order: config beside the script wins,
+    # then ~/.putio_config. Resolving it the same way is what keeps `config set`
+    # pointed at the file the scheduled run will actually read.
+    if [ -z "$CONFIG_PATH" ]; then
+        local script_dir
+        script_dir="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+        if [ -f "$script_dir/.putio_config" ]; then
+            CONFIG_PATH="$script_dir/.putio_config"
+        elif [ -f "$HOME/.putio_config" ]; then
+            CONFIG_PATH="$HOME/.putio_config"
+        else
+            die "No .putio_config found beside $SCRIPT_PATH or in $HOME"
+        fi
+    fi
+    [ -f "$CONFIG_PATH" ] || die "Config file not found: $CONFIG_PATH"
+}
+
+# Pull the settings we need out of the config. Sourced in this shell (it is a
+# plain list of assignments), then defaults are applied for anything the config
+# leaves out, matching the defaults in the processor script.
+load_config() {
+    # shellcheck disable=SC1090
+    source "$CONFIG_PATH" || die "Failed to read config: $CONFIG_PATH"
+
+    LOG_FILE="${LOG_FILE:-$HOME/Scripts/putio_download_and_delete.log}"
+    # Display-only setting: the processor never reads it, but it lives in the
+    # same config so the preference follows the log it applies to and shows up
+    # in `config list` like everything else.
+    LOGS_HIDE_IDLE="${LOGS_HIDE_IDLE:-false}"
+    LOCKFILE="${LOCKFILE:-/tmp/putio_download_and_delete.lock}"
+    PAUSE_FILE="${PAUSE_FILE:-$HOME/.putio_paused}"
+    LOCAL_DIR="${LOCAL_DIR:-}"
+    MEDIA_MOUNT_POINT="${MEDIA_MOUNT_POINT:-}"
+    MEDIA_MOUNT_STATE_DIR="${MEDIA_MOUNT_STATE_DIR:-/tmp/putio_mount_state}"
+    # Plain `-`, not `:-`: an empty PROGRESS_STATE_DIR in the config is the
+    # documented off-switch, and `:-` would substitute the default over it.
+    PROGRESS_STATE_DIR="${PROGRESS_STATE_DIR-/tmp/putio_progress}"
+    # The processor resolves jq the same way and the config can pin it, so read
+    # the pin here too. Otherwise the CLI parses the same rclone JSON with
+    # whatever jq the invoking environment happens to offer — Apple's under a
+    # minimal PATH, Homebrew's from a login shell — which is exactly the drift
+    # pinning exists to stop.
+    JQ_CMD="${JQ_CMD:-$(command -v jq 2>/dev/null)}"
+}
+
+# ---------------------------------------------------------------------------
+# Idle runs
+#
+# Cron fires every few minutes and most runs find nothing to do, which the
+# processor reports as a single INFO line. Those lines are the bulk of the log
+# and say nothing, so `putioctl quiet` filters them back out again.
+#
+# Matched without naming the em dash the processor writes between "successfully"
+# and the summary: `.*` spans it whatever the locale does to a multi-byte
+# character, and "nothing to do" is the summary only an idle run produces (a run
+# that downloaded nothing but saw files says "nothing downloaded" instead).
+# ---------------------------------------------------------------------------
+
+IDLE_LINE_RE='\[INFO\] === Script completed successfully .* nothing to do \('
+
+hide_idle_enabled() {
+    case "$(printf '%s' "${LOGS_HIDE_IDLE:-false}" | tr '[:upper:]' '[:lower:]')" in
+        true|yes|on|1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Run-state helpers
+# ---------------------------------------------------------------------------
+
+# Echoes the PID of the live run, or nothing. A lockfile whose PID is gone is
+# stale (the processor breaks those itself on its next start) and reported as
+# not running.
+running_pid() {
+    [ -f "$LOCKFILE" ] || return 1
+    local pid
+    pid=$(cat "$LOCKFILE" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s' "$pid"
+}
+
+is_paused() { [ -f "$PAUSE_FILE" ] && [ "$(pause_remaining)" != "expired" ]; }
+
+pause_field() {
+    [ -f "$PAUSE_FILE" ] || return 1
+    sed -n "s/^$1=//p" "$PAUSE_FILE" | sed 's/^"//; s/"$//' | head -1
+}
+
+# "indefinite", "expired", or the epoch the pause runs until.
+pause_remaining() {
+    local until
+    until=$(pause_field PAUSED_UNTIL)
+    if ! [[ "$until" =~ ^[0-9]+$ ]] || [ "$until" -eq 0 ]; then
+        printf 'indefinite'
+        return
+    fi
+    if [ "$(date +%s)" -ge "$until" ]; then printf 'expired'; else printf '%s' "$until"; fi
+}
+
+# BSD and GNU date disagree on the two conversions this file needs, so each has
+# one portable wrapper. BSD is tried first because macOS is the original home;
+# GNU `date -r` takes a *file*, so on Linux it fails and the second form runs.
+epoch_to_date() {  # epoch format
+    date -r "$1" "$2" 2>/dev/null || date -d "@$1" "$2" 2>/dev/null
+}
+stamp_to_epoch() {  # "YYYY-MM-DD HH:MM:SS"
+    date -j -f '%Y-%m-%d %H:%M:%S' "$1" +%s 2>/dev/null || date -d "$1" +%s 2>/dev/null
+}
+# A file's size in bytes. GNU first here, because BSD `stat -f` on Linux means
+# "filesystem status" and would print a block of unrelated text.
+file_size() {
+    stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null
+}
+
+# Clock times are shown 12-hour. The leading zero is stripped afterwards rather
+# than with %-I, which is a GNU extension BSD date only happens to accept: the
+# only space before the time is the one the format itself puts there, so the
+# first " 0" is the hour's zero or nothing at all.
+fmt_epoch() {
+    local t
+    t=$(epoch_to_date "$1" '+%Y-%m-%d %I:%M %p') || { printf '%s' "$1"; return; }
+    printf '%s' "${t/ 0/ }"
+}
+
+# Same, for the "YYYY-MM-DD HH:MM:SS" stamps the processor writes into its log.
+# Falls back to the raw stamp if it doesn't parse, so an odd line still shows.
+fmt_log_stamp() {
+    local epoch
+    epoch=$(stamp_to_epoch "$1") || { printf '%s' "$1"; return; }
+    fmt_epoch "$epoch"
+}
+
+# Second argument turns on seconds precision below the hour, for the next-run
+# countdown: rounded to whole minutes it reads as stalled, since the schedule is
+# usually only minutes away. Seconds are zero-padded so the field doesn't change
+# width as it ticks.
+fmt_duration() {
+    local s=$1 precise=${2:-}
+    if   [ "$s" -lt 60 ];   then printf '%ds' "$s"
+    elif [ "$s" -lt 3600 ]; then
+        if [ -n "$precise" ]; then printf '%dm %02ds' $((s / 60)) $((s % 60))
+        else printf '%dm' $((s / 60))
+        fi
+    elif [ "$s" -lt 86400 ]; then printf '%dh %dm' $((s / 3600)) $(((s % 3600) / 60))
+    else printf '%dd %dh' $((s / 86400)) $(((s % 86400) / 3600))
+    fi
+}
+
+# Describes the pause in one human phrase, e.g. "until 2026-08-14 6:00 PM (2h 5m left)".
+pause_description() {
+    local remaining
+    remaining=$(pause_remaining)
+    if [ "$remaining" = "indefinite" ]; then
+        printf 'indefinitely'
+    else
+        printf 'until %s (%s left)' "$(fmt_epoch "$remaining")" "$(fmt_duration $((remaining - $(date +%s))))"
+    fi
+}
+
+# The five cron fields the processor is scheduled on, or nothing if it has no
+# crontab entry. Shared by `status` and the console's status bar.
+cron_schedule() {
+    # The container has no cron: its scheduler loop runs on `*/N * * * *` and
+    # says so here, so status, the console and statusd report a schedule and a
+    # next run exactly as they do for a crontab entry.
+    if [ -n "${SYNC_SCHEDULE:-}" ]; then
+        printf '%s\n' "$SYNC_SCHEDULE"
+        return 0
+    fi
+    # `docker exec` shells don't inherit the entrypoint's exports, only the
+    # image's ENV, so derive it the way the entrypoint does.
+    if [ "${DROVIE_DOWNLOADER_CONTAINER:-}" = "1" ]; then
+        local n="${SYNC_INTERVAL_MINUTES:-5}"
+        case "$n" in ''|*[!0-9]*|0) n=5 ;; esac
+        printf '*/%s * * * *\n' "$n"
+        return 0
+    fi
+    crontab -l 2>/dev/null | grep -v '^[[:space:]]*#' | grep 'putio_download_and_delete' |
+        head -1 | awk '{print $1, $2, $3, $4, $5}'
+}
+
+# Depth-first list of a process and its descendants. Collected up front because
+# once the parent dies its children are reparented and pgrep -P can no longer
+# find them — which is how a killed run leaves orphaned rclone transfers behind.
+process_tree() {
+    local pid=$1 child
+    printf '%s\n' "$pid"
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        process_tree "$child"
+    done
+}
+
+# Removes the lockfile only while it still names the PID we dealt with. Between
+# a run dying and this call, cron can fire and a fresh run can take the lock —
+# deleting that would let a later tick start a second concurrent sync, which is
+# the exact thing the lock exists to prevent.
+release_lock_of() {
+    local expected=$1 current
+    [ -f "$LOCKFILE" ] || return 0
+    current=$(cat "$LOCKFILE" 2>/dev/null)
+    if [ "$current" = "$expected" ]; then
+        rm -f "$LOCKFILE"
+        return 0
+    fi
+    return 1
+}
+
+# Of the PIDs collected by process_tree, the ones still alive. Used to decide
+# whether SIGTERM was enough — the answer has to cover the descendants, since
+# the parent is the first to go and the transfers are what matter.
+tree_survivors() {
+    local p
+    for p in $1; do
+        kill -0 "$p" 2>/dev/null && printf '%s\n' "$p"
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# tui — the interactive console
+#
+# Presentation lives in putioctl_tui.py; this resolves every path it needs and
+# hands them over, so config discovery has exactly one implementation. The
+# console shells back out to this CLI for each command the user types.
+# ---------------------------------------------------------------------------
+
+cmd_tui() {
+    case "${1:-}" in -h|--help) usage_tui; return 0 ;; esac
+
+    local tui_script="$SELF_DIR/putioctl_tui.py"
+    [ -f "$tui_script" ] || tui_script="$(dirname "$SCRIPT_PATH")/putioctl_tui.py"
+
+    local python_bin
+    python_bin=$(command -v python3 2>/dev/null)
+
+    # Fall back to a plain status rather than failing: the console is a
+    # convenience, and every command it offers works without it.
+    if [ ! -f "$tui_script" ]; then
+        warn "Console not installed (putioctl_tui.py not found) — showing status instead."
+        cmd_status; return
+    fi
+    if [ -z "$python_bin" ]; then
+        warn "Console needs python3, which isn't on PATH — showing status instead."
+        cmd_status; return
+    fi
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        die "The console needs a terminal — use '$PROG status' or another subcommand."
+    fi
+
+    # The console's log filter is presentation, so the state lives here and is
+    # handed over like every other path it works with.
+    local -a tui_opts=()
+    hide_idle_enabled && tui_opts+=(--hide-idle)
+
+    exec "$python_bin" "$tui_script" \
+        --cli "$SELF_DIR/putioctl" \
+        --script "$SCRIPT_PATH" \
+        --config "$CONFIG_PATH" \
+        --log "$LOG_FILE" \
+        --lock "$LOCKFILE" \
+        --pause "$PAUSE_FILE" \
+        --mount "$MEDIA_MOUNT_POINT" \
+        --local-dir "$LOCAL_DIR" \
+        --progress-dir "$PROGRESS_STATE_DIR" \
+        --schedule "$(cron_schedule)" \
+        ${tui_opts+"${tui_opts[@]}"}
+}
+
+# ---------------------------------------------------------------------------
+# Is the media share mounted?
+#
+# `mount` lives in /sbin, and /sbin is NOT on the PATH bash falls back to when
+# the environment carries none (`/usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:.`).
+# A launchd agent's environment carries none unless its plist sets one, so under
+# the statusd launchd job the bare name resolved to nothing at all: the pipeline
+# printed nothing, `grep -q` failed, and that failure was read as "the share is
+# gone". putio-statusd reported mount.ok false against a perfectly healthy
+# mount, and Drovie faithfully drew it red. The plist now sets a PATH too
+# — neither fix has to be the one that holds.
+#
+# Absolute first, PATH second, so this doesn't trade one single point of failure
+# for another on a box that puts mount somewhere else.
+MOUNT_CMD="${MOUNT_CMD:-/sbin/mount}"
+[ -x "$MOUNT_CMD" ] || MOUNT_CMD="$(command -v mount 2>/dev/null)"
+
+# 0 mounted, 1 not mounted, 2 the check could not run — a distinction the old
+# if/else collapsed, which is the whole bug. Reads the mount table rather than
+# stat'ing the path: a stat on a dropped share blocks in the kernel, and putioctl
+# is called by a daemon whose entire design is about never blocking there.
+#
+# grep -F, not a regex: the mount point is data, and a path holding a regex
+# metacharacter would otherwise match something else or nothing at all.
+#
+# A herestring rather than `printf | grep`, because `set -o pipefail` is on: a
+# `grep -q` that matches early exits while the writer is still writing, the
+# writer takes SIGPIPE, and pipefail reports the whole pipeline as 141 — read
+# here as "no match", which would put us right back to calling a mounted share
+# dead. No pipe, no race.
+mount_state() {
+    local path="$1" table
+    [ -n "$MOUNT_CMD" ] && [ -x "$MOUNT_CMD" ] || return 2
+    table=$("$MOUNT_CMD" 2>/dev/null) || return 2
+    [ -n "$table" ] || return 2
+    grep -qF " on $path " <<<"$table" && return 0
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+    local pid
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) status_json; return 0 ;;
+            -h|--help) usage_status; return 0 ;;
+            *) err "Unknown option: $1"; usage_status; return 1 ;;
+        esac
+    done
+
+    printf '%s%sput.io sync status%s\n\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+
+    # --- schedule / pause ---
+    if is_paused; then
+        local reason
+        reason=$(pause_field PAUSED_REASON)
+        printf '  %sPaused%s      %s%s\n' "$C_YELLOW" "$C_RESET" "$(pause_description)" \
+            "${reason:+ — $reason}"
+    else
+        printf '  %sActive%s      scheduled runs are enabled\n' "$C_GREEN" "$C_RESET"
+    fi
+
+    # --- current run ---
+    if pid=$(running_pid); then
+        local elapsed
+        elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+        printf '  %sRunning%s     PID %s, elapsed %s\n' "$C_GREEN" "$C_RESET" "$pid" "${elapsed:-unknown}"
+        local last
+        last=$(tail -n 1 "$LOG_FILE" 2>/dev/null)
+        [ -n "$last" ] && printf '              %s%s%s\n' "$C_DIM" "$last" "$C_RESET"
+        # A run spends most of its time in exactly one download, and "elapsed
+        # 22m" says nothing about whether that is progress or a stall.
+        local meta metas bar
+        metas=$(progress_files)
+        if [ -n "$metas" ]; then
+            # 14 is the indent every second line in this block sits at.
+            bar=$(progress_bar_width 14 "$(term_cols)")
+            while IFS= read -r meta; do
+                [ -n "$meta" ] || continue
+                progress_read_meta "$meta" || continue
+                progress_position
+                printf '  Transfer    %s\n' "$P_NAME"
+                printf '              %s\n' "$(progress_line "$bar")"
+            done <<<"$metas"
+        fi
+    else
+        printf '  Idle        no run in progress\n'
+        if [ -f "$LOCKFILE" ]; then
+            printf '              %sstale lockfile present (%s) — cleared automatically on next run%s\n' \
+                "$C_DIM" "$LOCKFILE" "$C_RESET"
+        fi
+    fi
+
+    # --- last completed run ---
+    if [ -f "$LOG_FILE" ]; then
+        local last_done last_err
+        last_done=$(grep -a 'Script completed successfully' "$LOG_FILE" 2>/dev/null | tail -n 1 |
+            sed -n 's/^\[\([^]]*\)\].*/\1/p')
+        [ -n "$last_done" ] && printf '  Last run    completed %s\n' "$(fmt_log_stamp "$last_done")"
+        # Levels are bracketed: "[2026-08-22 15:45:02] [ERROR] ...".
+        last_err=$(grep -ac '\[ERROR\]' "$LOG_FILE" 2>/dev/null)
+        if [ -n "$last_err" ] && [ "$last_err" -gt 0 ]; then
+            printf '  Errors      %s in the retained log — %s%s logs --errors%s\n' \
+                "$last_err" "$C_DIM" "$PROG" "$C_RESET"
+        fi
+    fi
+
+    # --- cron schedule ---
+    local expr
+    expr=$(cron_schedule)
+    if [ -n "$expr" ]; then
+        local next
+        printf '  Schedule    %s\n' "$expr"
+        # Only the every-N-minutes form is worth predicting; anything else is
+        # shown as-is rather than half-parsed.
+        if [[ "$expr" =~ ^\*/([0-9]+)\ \*\ \*\ \*\ \*$ ]] && [ "${BASH_REMATCH[1]}" -gt 0 ]; then
+            local n min sec ahead cand
+            n=${BASH_REMATCH[1]}
+            min=$((10#$(date +%M))); sec=$((10#$(date +%S)))
+            # `*/N` is the set {0, N, 2N, ...} below 60, restarted every hour —
+            # so for an N that doesn't divide 60 the last slot is short and the
+            # next fire is :00 of the next hour, not min+N.
+            cand=$(( (min / n + 1) * n ))
+            [ "$cand" -ge 60 ] && cand=60
+            ahead=$(( (cand - min) * 60 - sec ))
+            next=$(( $(date +%s) + ahead ))
+            printf '              next run %s (in %s)\n' "$(fmt_epoch "$next")" "$(fmt_duration "$ahead" precise)"
+        fi
+    else
+        printf '  Schedule    %sno cron entry found for the processor%s\n' "$C_YELLOW" "$C_RESET"
+    fi
+
+    # --- storage ---
+    if [ -n "$MEDIA_MOUNT_POINT" ]; then
+        mount_state "$MEDIA_MOUNT_POINT"
+        case $? in
+            0) printf '  Mount       %s mounted\n' "$MEDIA_MOUNT_POINT" ;;
+            1) printf '  Mount       %s%s NOT mounted%s\n' "$C_RED" "$MEDIA_MOUNT_POINT" "$C_RESET" ;;
+            *) printf '  Mount       %s%s unknown — cannot run mount%s\n' \
+                   "$C_YELLOW" "$MEDIA_MOUNT_POINT" "$C_RESET" ;;
+        esac
+    fi
+    if [ -n "$LOCAL_DIR" ] && [ -d "$LOCAL_DIR" ]; then
+        local free
+        free=$(df -h "$LOCAL_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+        [ -n "$free" ] && printf '  Free space  %s available at %s\n' "$free" "$LOCAL_DIR"
+    fi
+
+    printf '\n  %sscript%s  %s\n  %sconfig%s  %s\n  %slog%s     %s\n' \
+        "$C_DIM" "$C_RESET" "$SCRIPT_PATH" \
+        "$C_DIM" "$C_RESET" "$CONFIG_PATH" \
+        "$C_DIM" "$C_RESET" "$LOG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# progress
+#
+# The processor publishes one meta file per in-flight download under
+# PROGRESS_STATE_DIR, with rclone's JSON stats log beside it — see "Transfer
+# progress" in the processor script. Nothing here starts or touches a transfer;
+# it reads those files and draws them.
+#
+# They are named dl.<runpid>.<jobid>.meta, and a run killed mid-transfer never
+# reaches its cleanup, so the run pid is checked before anything is drawn.
+# Otherwise a stopped sync would leave a bar frozen at 60% until the next run
+# swept it away.
+# ---------------------------------------------------------------------------
+
+BAR_FILL="█"
+BAR_EMPTY="░"
+
+# Terminal width, or 80 when there is nothing sensible to ask (output piped to
+# a file, no TERM). A width under 40 is treated the same way: it is more likely
+# a terminfo answer we shouldn't trust than a terminal that narrow.
+term_cols() {
+    local cols
+    cols=$(tput cols 2>/dev/null) || cols=80
+    case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
+    [ "$cols" -ge 40 ] || cols=80
+    printf '%s' "$cols"
+}
+
+# Bar sized to what is left after the indent it sits behind and the ~50 columns
+# of numbers beside it, so the line fits an 80-column terminal instead of
+# wrapping mid-figure. Capped at 28 so it doesn't sprawl on a wide one.
+progress_bar_width() {
+    local indent=$1 cols=$2 w
+    w=$(( cols - indent - 52 ))
+    [ "$w" -gt 28 ] && w=28
+    [ "$w" -lt 10 ] && w=10
+    printf '%s' "$w"
+}
+
+# Meta files of transfers whose run is still alive, in a stable order.
+progress_files() {
+    [ -n "${PROGRESS_STATE_DIR:-}" ] && [ -d "$PROGRESS_STATE_DIR" ] || return 0
+    local f pid
+    for f in "$PROGRESS_STATE_DIR"/dl.*.meta; do
+        [ -e "$f" ] || continue
+        pid=$(basename "$f" | cut -d. -f2)
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        kill -0 "$pid" 2>/dev/null || continue
+        printf '%s\n' "$f"
+    done
+}
+
+# Loads one meta file into the P_* globals. Read rather than sourced: the
+# values are raw, and a release name with a space or a quote in it would
+# otherwise be executed rather than assigned.
+progress_read_meta() {
+    P_PHASE=""; P_STARTED=0; P_SIZE=0; P_NAME=""; P_DEST=""; P_LOG=""
+    # The transfer can finish between the listing and this read, taking its
+    # meta file with it. Stderr is silenced ahead of the input redirect (bash
+    # applies them left to right, so the other order still lets the failure
+    # print) — a completed download must not spit a shell error into the
+    # middle of `status`.
+    local key value
+    while IFS='=' read -r key value; do
+        case "$key" in
+            PHASE)   P_PHASE="$value" ;;
+            STARTED) P_STARTED="$value" ;;
+            SIZE)    P_SIZE="$value" ;;
+            NAME)    P_NAME="$value" ;;
+            DEST)    P_DEST="$value" ;;
+            LOG)     P_LOG="$value" ;;
+        esac
+    done 2>/dev/null < "$1"
+    case "$P_SIZE" in ''|*[!0-9]*) P_SIZE=0 ;; esac
+    case "$P_STARTED" in ''|*[!0-9]*) P_STARTED=0 ;; esac
+    [ -n "$P_NAME" ]
+}
+
+# Where the transfer has got to, into P_BYTES/P_SPEED/P_ETA (empty when not yet
+# known — the first stats tick is a few seconds after the transfer appears).
+#
+#   download  the last stats line in rclone's JSON log
+#   copy      the size of the destination file: the staged copy onto the share
+#             is a plain cp, which reports nothing at all
+progress_position() {
+    P_BYTES=""; P_SPEED=""; P_ETA=""
+    if [ "$P_PHASE" = "copy" ]; then
+        [ -n "$P_DEST" ] || return 0
+        P_BYTES=$(file_size "$P_DEST") || P_BYTES=""
+        return 0
+    fi
+    [ -n "$P_LOG" ] && [ -s "$P_LOG" ] || return 0
+    [ -n "$JQ_CMD" ] && [ -x "$JQ_CMD" ] || return 0
+    local line parsed
+    # Tail rather than scan: stats lines are appended every few seconds and only
+    # the last one matters, but an error line can sit between it and the end.
+    line=$(tail -n 40 "$P_LOG" 2>/dev/null | grep '"stats"' | tail -n 1)
+    [ -n "$line" ] || return 0
+    parsed=$(printf '%s' "$line" |
+        "$JQ_CMD" -r '.stats | "\(.bytes // 0) \((.speed // 0) | floor) \((.eta // -1) | floor)"' 2>/dev/null) || return 0
+    read -r P_BYTES P_SPEED P_ETA <<<"$parsed"
+    return 0
+}
+
+progress_bar() {
+    local pct=$1 width=$2 i filled out=""
+    [ "$pct" -lt 0 ] && pct=0
+    [ "$pct" -gt 100 ] && pct=100
+    filled=$(( pct * width / 100 ))
+    for ((i = 0; i < width; i++)); do
+        if [ "$i" -lt "$filled" ]; then out="$out$BAR_FILL"; else out="$out$BAR_EMPTY"; fi
+    done
+    printf '%s' "$out"
+}
+
+# awk because bash has no floating point, and "1.9 GiB" reads better than the
+# "1 GiB" integer division would give on a file nowhere near the boundary.
+fmt_bytes() {
+    awk -v b="${1:-0}" 'BEGIN {
+        split("B KiB MiB GiB TiB", u, " ")
+        i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        if (i == 1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i]
+    }'
+}
+
+# The bar plus its numbers, for whichever P_* the caller has just loaded.
+progress_line() {
+    local width=$1 pct=-1 out
+    if [ -n "$P_BYTES" ] && [ "$P_SIZE" -gt 0 ]; then
+        pct=$(( P_BYTES * 100 / P_SIZE ))
+    fi
+    if [ "$pct" -lt 0 ]; then
+        # No number yet: before rclone's first stats tick, or a copy whose
+        # destination file has not appeared on the share.
+        local waiting="starting…"
+        [ "$P_PHASE" = "copy" ] && waiting="copying to the library"
+        printf '%s  %s' "$(progress_bar 0 "$width")" "$waiting"
+        return 0
+    fi
+    out=$(printf '%s %3d%%  %s / %s' "$(progress_bar "$pct" "$width")" "$pct" \
+        "$(fmt_bytes "$P_BYTES")" "$(fmt_bytes "$P_SIZE")")
+    if [ "$P_PHASE" = "copy" ]; then
+        printf '%s · copying to the library' "$out"
+        return 0
+    fi
+    [ -n "$P_SPEED" ] && [ "$P_SPEED" -gt 0 ] && out="$out · $(fmt_bytes "$P_SPEED")/s"
+    [ -n "$P_ETA" ] && [ "$P_ETA" -ge 0 ] && out="$out · ETA $(fmt_duration "$P_ETA")"
+    printf '%s' "$out"
+}
+
+# One transfer, two lines: the name on its own so a long release name doesn't
+# push the bar off the right edge of the terminal.
+progress_show_one() {
+    local meta=$1 width=$2 name_width
+    # Non-zero when there was nothing to draw, so the caller can tell an empty
+    # listing from one whose transfers all finished while it was reading.
+    progress_read_meta "$meta" || return 1
+    progress_position
+    name_width=$(( width - 24 ))
+    # Elapsed beside the name rather than in the bar line: on the copy phase
+    # there is no ETA and no speed, and "12m in" is then the only thing that
+    # says whether the share is still moving bytes.
+    local since=""
+    [ "$P_STARTED" -gt 0 ] && since=" · $(fmt_duration $(( $(date +%s) - P_STARTED )) precise) in"
+    printf '  %s%s%s%s%s%s\n' "$C_BOLD" "$(printf '%.*s' "$name_width" "$P_NAME")" "$C_RESET" \
+        "$C_DIM" "$since" "$C_RESET"
+    printf '  %s\n' "$(progress_line "$(progress_bar_width 2 "$width")")"
+}
+
+# ---------------------------------------------------------------------------
+# JSON output
+#
+# `--json` on status and progress is the machine-readable face of everything
+# above. It exists so putio-statusd has one place to read from rather than a
+# second implementation of the progress protocol — the same reason the console
+# shells back out to this CLI instead of parsing config itself.
+#
+# The shape is a contract. `schema` is bumped when a field changes meaning,
+# never when one is added, because an old Drovie app build keeps polling long
+# after the server has moved on.
+#
+# Built with jq rather than printf: release names come from put.io and
+# routinely carry quotes, backslashes and non-ASCII, and hand-rolled escaping
+# survives none of them.
+#
+# NOTE TO CALLERS — these can block. A transfer in its copy phase is measured
+# by stat'ing the destination on the SMB share, and free space runs df against
+# the same share; both sit in the kernel when the NAS drops. putio-statusd
+# therefore runs this on a background thread under a timeout and serves its
+# last good snapshot. Anything else polling it must do the same.
+# ---------------------------------------------------------------------------
+
+SCHEMA_VERSION=1
+
+# launchd job that serves the JSON above to Drovie. It was com.putio.statusd,
+# which reads as put.io's own; statusd_reinstall retires the old job.
+STATUSD_LABEL="app.drovie.downloader.statusd"
+STATUSD_OLD_LABEL="com.putio.statusd"
+STATUSD_DOMAIN="gui/$(id -u)"
+STATUSD_PLIST="$HOME/Library/LaunchAgents/$STATUSD_LABEL.plist"
+
+# Registered with launchd? `launchctl print` asks about this job specifically;
+# `launchctl list | grep` matches the label anywhere in the output and cannot
+# tell a registered job from a stray mention.
+statusd_loaded() {
+    launchctl print "$STATUSD_DOMAIN/$STATUSD_LABEL" >/dev/null 2>&1
+}
+
+# The plist is the one deployable that does NOT live in ~/Scripts, so
+# `putioctl deploy` never installs it and drift is silent — the installed copy
+# can lag the repo indefinitely with everything looking healthy. This answers
+# whether it has:
+#   0 in sync   1 drifted   2 not installed   3 no repo copy to compare against
+statusd_plist_state() {
+    local src="$1"
+    [ -f "$src" ] || return 3
+    [ -f "$STATUSD_PLIST" ] || return 2
+    [ "$(sed "s|__HOME__|$HOME|g" "$src")" = "$(cat "$STATUSD_PLIST")" ] || return 1
+    return 0
+}
+
+require_jq_json() {
+    [ -n "${JQ_CMD:-}" ] && [ -x "${JQ_CMD:-}" ] ||
+        die "jq is required for --json (pin JQ_CMD in $CONFIG_PATH)"
+}
+
+# A bare integer, or JSON null for anything that isn't one. rclone reports an
+# unknown ETA as -1, which lands here as null on purpose.
+json_num() {
+    case "${1:-}" in
+        ''|*[!0-9]*) printf 'null' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# `ps -o etime=` in seconds. BSD ps has no `etimes`, and the field arrives as
+# [[dd-]hh:]mm:ss. 10# forces base ten — the parts are zero-padded and 08 is
+# not a valid octal literal.
+etime_seconds() {
+    local e="${1:-}" d="" h="" m="" s=""
+    [ -n "$e" ] || { printf 'null'; return 0; }
+    case "$e" in *-*) d="${e%%-*}"; e="${e#*-}" ;; esac
+    case "$e" in
+        *:*:*) IFS=: read -r h m s <<<"$e" ;;
+        *:*)   IFS=: read -r m s <<<"$e" ;;
+        *)     s="$e" ;;
+    esac
+    d="${d:-0}"; h="${h:-0}"; m="${m:-0}"; s="${s:-0}"
+    case "$d$h$m$s" in ''|*[!0-9]*) printf 'null'; return 0 ;; esac
+    printf '%s' $(( 10#$d * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+}
+
+# The in-flight transfers, as a JSON array. Same source as the drawn bars:
+# whatever progress_files considers live.
+progress_json() {
+    require_jq_json
+    local metas meta now pct elapsed
+    now=$(date +%s)
+    metas=$(progress_files)
+    {
+        if [ -n "$metas" ]; then
+            while IFS= read -r meta; do
+                [ -n "$meta" ] || continue
+                progress_read_meta "$meta" || continue
+                progress_position
+                pct=null
+                if [ -n "${P_BYTES:-}" ] && [ "${P_SIZE:-0}" -gt 0 ]; then
+                    pct=$(( P_BYTES * 100 / P_SIZE ))
+                fi
+                elapsed=null
+                [ "${P_STARTED:-0}" -gt 0 ] && elapsed=$(( now - P_STARTED ))
+                "$JQ_CMD" -n \
+                    --arg     name    "${P_NAME:-}" \
+                    --arg     phase   "${P_PHASE:-download}" \
+                    --arg     dest    "${P_DEST:-}" \
+                    --argjson size    "$(json_num "${P_SIZE:-}")" \
+                    --argjson done    "$(json_num "${P_BYTES:-}")" \
+                    --argjson pct     "$pct" \
+                    --argjson speed   "$(json_num "${P_SPEED:-}")" \
+                    --argjson eta     "$(json_num "${P_ETA:-}")" \
+                    --argjson started "$(json_num "${P_STARTED:-}")" \
+                    --argjson elapsed "$elapsed" \
+                    '{name:$name, phase:$phase, dest:$dest,
+                      size_bytes:$size, bytes_done:$done, percent:$pct,
+                      speed_bps:$speed, eta_seconds:$eta,
+                      started_epoch:$started, elapsed_seconds:$elapsed}'
+            done <<<"$metas"
+        fi
+    } | "$JQ_CMD" -s .
+}
+
+# Everything status prints, as one object — transfers included, so a caller
+# needs a single invocation to get a coherent picture rather than two that can
+# disagree about whether a download finished between them.
+status_json() {
+    require_jq_json
+    local now pid state transfers run_json
+    now=$(date +%s)
+    transfers=$(progress_json)
+
+    pid=$(running_pid) || pid=""
+    if [ -n "$pid" ]; then
+        state=running
+        local et
+        et=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+        run_json=$("$JQ_CMD" -n \
+            --argjson pid "$(json_num "$pid")" \
+            --argjson el  "$(etime_seconds "$et")" \
+            '{pid:$pid, elapsed_seconds:$el}')
+    elif is_paused; then
+        state=paused
+        run_json=null
+    else
+        state=idle
+        run_json=null
+    fi
+
+    # Reported alongside `state` rather than folded into it: a run already in
+    # flight when the pause landed keeps going, so "running" and "paused" are
+    # not mutually exclusive and a caller may care about either.
+    local p_active=false p_until=null p_reason=""
+    if is_paused; then
+        p_active=true
+        p_until=$(json_num "$(pause_field PAUSED_UNTIL)")
+        p_reason=$(pause_field PAUSED_REASON)
+    fi
+
+    local lr_stamp="" lr_outcome="" lr_epoch=null line
+    if [ -f "$LOG_FILE" ]; then
+        line=$(grep -a 'Script completed successfully' "$LOG_FILE" 2>/dev/null | tail -n 1)
+        if [ -n "$line" ]; then
+            lr_stamp=$(printf '%s' "$line" | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+            # Everything after the phrase, minus the trailing banner. The em
+            # dash is stripped by the leading-punctuation rule rather than
+            # matched, same as IDLE_LINE_RE avoids naming it.
+            lr_outcome=$(printf '%s' "$line" |
+                sed -e 's/.*Script completed successfully//' \
+                    -e 's/[[:space:]]*===[[:space:]]*$//' \
+                    -e 's/^[^[:alnum:]]*//')
+            [ -n "$lr_stamp" ] &&
+                lr_epoch=$(json_num "$(stamp_to_epoch "$lr_stamp")")
+        fi
+    fi
+
+    local errs=0
+    [ -f "$LOG_FILE" ] && errs=$(grep -ac '\[ERROR\]' "$LOG_FILE" 2>/dev/null)
+    errs=$(json_num "$errs")
+
+    local m_path="${MEDIA_MOUNT_POINT:-}" m_ok=null
+    if [ -n "$m_path" ]; then
+        mount_state "$m_path"
+        case $? in
+            0) m_ok=true ;;
+            1) m_ok=false ;;
+            # null, not false. STATUS_API types mount.ok as `boolean | null`, and
+            # "we could not ask" is not "the share is gone" — conflating them is
+            # what put a red NOT MOUNTED in Drovie over a healthy share.
+            *) m_ok=null ;;
+        esac
+    fi
+
+    local free_kb free_bytes=null
+    if [ -n "${LOCAL_DIR:-}" ] && [ -d "$LOCAL_DIR" ]; then
+        free_kb=$(df -k "$LOCAL_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+        case "${free_kb:-}" in ''|*[!0-9]*) : ;; *) free_bytes=$(( free_kb * 1024 )) ;; esac
+    fi
+
+    "$JQ_CMD" -n \
+        --argjson schema    "$SCHEMA_VERSION" \
+        --arg     generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson epoch     "$now" \
+        --arg     state     "$state" \
+        --argjson paused_a  "$p_active" \
+        --argjson paused_u  "$p_until" \
+        --arg     paused_r  "$p_reason" \
+        --argjson run       "$run_json" \
+        --argjson transfers "$transfers" \
+        --arg     lr_at     "$lr_stamp" \
+        --argjson lr_epoch  "$lr_epoch" \
+        --arg     lr_out    "$lr_outcome" \
+        --argjson errors    "$errs" \
+        --arg     schedule  "$(cron_schedule)" \
+        --arg     mount_p   "$m_path" \
+        --argjson mount_ok  "$m_ok" \
+        --argjson free_b    "$free_bytes" \
+        '{
+          schema: $schema,
+          generated_at: $generated,
+          generated_epoch: $epoch,
+          state: $state,
+          paused: { active: $paused_a, until_epoch: $paused_u,
+                    reason: (if $paused_r == "" then null else $paused_r end) },
+          run: $run,
+          transfers: $transfers,
+          last_run: { at: (if $lr_at == "" then null else $lr_at end),
+                      at_epoch: $lr_epoch,
+                      outcome: (if $lr_out == "" then null else $lr_out end) },
+          errors_in_log: $errors,
+          schedule: (if $schedule == "" then null else $schedule end),
+          mount: { path: (if $mount_p == "" then null else $mount_p end), ok: $mount_ok },
+          disk: { free_bytes: $free_b }
+        }'
+}
+
+cmd_progress() {
+    local watch=0 interval=2 as_json=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage_progress; return 0 ;;
+            --json) as_json=1 ;;
+            -w|--watch) watch=1 ;;
+            -n|--interval)
+                shift
+                case "${1:-}" in
+                    ''|*[!0-9]*) die "Refresh interval must be a whole number of seconds" ;;
+                esac
+                [ "$1" -gt 0 ] || die "Refresh interval must be at least 1 second"
+                interval="$1"
+                watch=1
+                ;;
+            *) err "Unknown option: $1"; usage_progress; return 1 ;;
+        esac
+        shift
+    done
+
+    # Machine-readable output is a single shot whatever -w said: a caller that
+    # wants to poll runs the command again, and interleaving JSON documents
+    # into one stream would give it nothing it could parse.
+    if [ "$as_json" -eq 1 ]; then
+        progress_json
+        return 0
+    fi
+
+    if [ "$watch" -eq 0 ]; then
+        progress_print
+        return 0
+    fi
+
+    # Watch mode owns the screen until Ctrl-C. The cursor is hidden while it
+    # does and put back on the way out however that happens, so an interrupted
+    # watch doesn't leave the terminal without a caret.
+    printf '\033[?25l'
+    trap 'printf "\033[?25h\n"; exit 0' INT TERM
+    while :; do
+        printf '\033[H\033[2J'
+        progress_print
+        printf '\n  %srefreshing every %ss · Ctrl-C to stop%s\n' "$C_DIM" "$interval" "$C_RESET"
+        sleep "$interval"
+    done
+}
+
+progress_print() {
+    local width metas count=0 meta pid
+    width=$(term_cols)
+
+    printf '%s%sput.io transfers%s\n\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+
+    metas=$(progress_files)
+    if [ -n "$metas" ]; then
+        while IFS= read -r meta; do
+            [ -n "$meta" ] || continue
+            [ "$count" -gt 0 ] && printf '\n'
+            if progress_show_one "$meta" "$width"; then
+                count=$((count + 1))
+            fi
+        done <<<"$metas"
+    fi
+    # Counted from what actually rendered, not from the listing: a transfer
+    # that ended mid-read would otherwise leave the header standing alone with
+    # no rows under it and no explanation.
+    [ "$count" -gt 0 ] && return 0
+
+    # Nothing in flight is the normal state, so say which kind of nothing it is:
+    # a run that is busy elsewhere reads very differently from no run at all.
+    if pid=$(running_pid); then
+        printf '  No transfer in flight — the run (PID %s) is listing, extracting or organizing.\n' "$pid"
+    elif is_paused; then
+        printf '  No run in progress — scheduled runs are paused %s.\n' "$(pause_description)"
+    else
+        printf '  No run in progress.\n'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# sync
+# ---------------------------------------------------------------------------
+
+cmd_sync() {
+    local follow=0 force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--follow) follow=1 ;;
+            --force)     force=1 ;;
+            -h|--help)   usage_sync; return 0 ;;
+            *) die "sync: unknown option '$1' (see $PROG sync --help)" ;;
+        esac
+        shift
+    done
+
+    local pid
+    if pid=$(running_pid); then
+        local elapsed
+        elapsed=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+        err "A sync is already running (PID $pid, elapsed ${elapsed:-unknown})."
+        info "  Follow it with:  $PROG logs -f"
+        info "  Stop it with:    $PROG stop"
+        return 1
+    fi
+
+    if is_paused && [ "$force" -eq 0 ]; then
+        err "Sync is paused $(pause_description)."
+        info "  Resume the schedule:  $PROG resume"
+        info "  Run once anyway:      $PROG sync --force"
+        return 1
+    fi
+
+    [ -x "$SCRIPT_PATH" ] || die "Processor script is not executable: $SCRIPT_PATH"
+
+    local run_out="/tmp/putio_manual_run.log"
+    # PUTIO_IGNORE_PAUSE only matters under --force; setting it unconditionally
+    # would make a manual sync silently ignore a pause set a second ago.
+    if [ "$force" -eq 1 ]; then
+        PUTIO_IGNORE_PAUSE=1 nohup "$SCRIPT_PATH" >"$run_out" 2>&1 &
+    else
+        nohup "$SCRIPT_PATH" >"$run_out" 2>&1 &
+    fi
+    local child=$!
+
+    ok "Sync started (PID $child)"
+    [ "$force" -eq 1 ] && warn "Pause bypassed for this run — the pause is still in effect for scheduled runs."
+
+    if [ "$follow" -eq 0 ]; then
+        disown "$child" 2>/dev/null
+        info "  Follow with:  $PROG logs -f"
+        return 0
+    fi
+
+    # Follow mode: stream new log lines until the run exits. Ctrl-C detaches the
+    # viewer only — killing the transfer needs an explicit `putioctl stop`.
+    info "  Following ${LOG_FILE} (Ctrl-C detaches, the run continues)"
+    tail -n 0 -f "$LOG_FILE" 2>/dev/null &
+    local tail_pid=$!
+    trap 'kill "$tail_pid" 2>/dev/null; printf "\n"; warn "Detached — sync continues in the background (PID '"$child"')"; exit 130' INT
+    wait "$child"
+    local rc=$?
+    sleep 1                      # let tail flush the closing log lines
+    kill "$tail_pid" 2>/dev/null
+    trap - INT
+    # A run refused the lock exits 0 — an overlap is the schedule working, not a
+    # failure — so the status alone would report "Sync finished" for a run that
+    # did nothing. $run_out is this run's own stdout (the processor tees every
+    # log line to it), so it says which of the two happened without racing the
+    # shared log against another writer.
+    if [ "$rc" -eq 0 ] && grep -q '\[LOCK\] A sync is already running' "$run_out" 2>/dev/null; then
+        warn "Another sync had already started — this run did nothing"
+        info "  Follow the one that is running:  $PROG logs -f"
+    elif [ "$rc" -eq 0 ]; then
+        ok "Sync finished"
+    else
+        err "Sync exited with status $rc (stdout/stderr in $run_out)"
+    fi
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# pause / resume
+# ---------------------------------------------------------------------------
+
+# "90" -> minutes, "45m", "2h", "3d", "30s" -> seconds. Echoes seconds.
+parse_duration() {
+    local raw=$1 num unit
+    if [[ "$raw" =~ ^([0-9]+)([smhdSMHD]?)$ ]]; then
+        num=${BASH_REMATCH[1]}
+        unit=$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')
+        case "${unit:-m}" in
+            s) printf '%s' "$num" ;;
+            m) printf '%s' $((num * 60)) ;;
+            h) printf '%s' $((num * 3600)) ;;
+            d) printf '%s' $((num * 86400)) ;;
+        esac
+        return 0
+    fi
+    return 1
+}
+
+cmd_pause() {
+    local duration="" reason=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -m|--message|--reason) shift; reason="${1:-}" ;;
+            -h|--help) usage_pause; return 0 ;;
+            -*) die "pause: unknown option '$1' (see $PROG pause --help)" ;;
+            *)  duration="$1" ;;
+        esac
+        shift
+    done
+
+    local until=0
+    if [ -n "$duration" ]; then
+        local secs
+        secs=$(parse_duration "$duration") ||
+            die "pause: can't read duration '$duration' (try 30m, 2h, 1d — a bare number means minutes)"
+        until=$(( $(date +%s) + secs ))
+    fi
+
+    umask 077
+    {
+        printf '# put.io sync pause marker — written by %s %s\n' "$PROG" "$PUTIOCTL_VERSION"
+        printf '# Remove this file or run `%s resume` to re-enable scheduled runs.\n' "$PROG"
+        printf 'PAUSED_AT=%s\n' "$(date +%s)"
+        printf 'PAUSED_UNTIL=%s\n' "$until"
+        printf 'PAUSED_REASON="%s"\n' "${reason//\"/\'}"
+    } > "$PAUSE_FILE" || die "Failed to write pause file: $PAUSE_FILE"
+
+    ok "Sync paused $(pause_description)${reason:+ — $reason}"
+
+    local pid
+    if pid=$(running_pid); then
+        warn "A sync is currently running (PID $pid); pausing does not interrupt it."
+        info "  Stop it too with:  $PROG stop"
+    fi
+}
+
+cmd_resume() {
+    case "${1:-}" in -h|--help) usage_resume; return 0 ;; esac
+
+    if [ ! -f "$PAUSE_FILE" ]; then
+        info "Sync is not paused — nothing to do."
+        return 0
+    fi
+    rm -f "$PAUSE_FILE" || die "Failed to remove pause file: $PAUSE_FILE"
+    ok "Sync resumed — scheduled runs will proceed."
+    info "  Run one right now with:  $PROG sync"
+}
+
+# ---------------------------------------------------------------------------
+# stop
+# ---------------------------------------------------------------------------
+
+cmd_stop() {
+    local timeout=30
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -t|--timeout) shift; timeout="${1:-30}" ;;
+            -h|--help) usage_stop; return 0 ;;
+            *) die "stop: unknown option '$1' (see $PROG stop --help)" ;;
+        esac
+        shift
+    done
+
+    local pid stale
+    if ! pid=$(running_pid); then
+        info "No sync is running."
+        # A lockfile with a dead owner would be broken by the next scheduled run
+        # anyway, but clearing it here keeps `status` honest. Only clear the
+        # exact stale PID we just read: a run may have started since.
+        stale=$(cat "$LOCKFILE" 2>/dev/null)
+        if [ -n "$stale" ] && release_lock_of "$stale"; then
+            ok "Cleared stale lockfile"
+        fi
+        return 0
+    fi
+
+    local tree children
+    tree=$(process_tree "$pid")
+    children=$(( $(printf '%s\n' "$tree" | wc -l | tr -d ' ') - 1 ))
+    info "Stopping sync (PID $pid and $children child process$([ "$children" -eq 1 ] || printf 'es'))..."
+
+    # SIGTERM the parent first so it stops dispatching new downloads, then the
+    # descendants that are already transferring.
+    printf '%s\n' "$tree" | while read -r p; do kill -TERM "$p" 2>/dev/null; done
+
+    # Wait on the whole tree, not just the parent. The processor is untrapped
+    # bash and dies on the first SIGTERM, but an rclone child mid-transfer can
+    # take longer — watching only the parent declares victory while the
+    # transfer is still writing to the library, and the next cron run then
+    # starts a second writer on the same file.
+    local waited=0
+    while [ "$waited" -lt "$timeout" ] && [ -n "$(tree_survivors "$tree")" ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    local survivors
+    survivors=$(tree_survivors "$tree")
+    if [ -n "$survivors" ]; then
+        warn "Still alive after ${timeout}s — sending SIGKILL to $(printf '%s' "$survivors" | tr '\n' ' ')"
+        printf '%s\n' "$survivors" | while read -r p; do kill -KILL "$p" 2>/dev/null; done
+        sleep 1
+        survivors=$(tree_survivors "$tree")
+    fi
+
+    if [ -n "$survivors" ]; then
+        err "Could not stop these processes: $(printf '%s' "$survivors" | tr '\n' ' ')"
+        err "Leaving the lockfile in place — they may still be writing to the library."
+        return 1
+    fi
+
+    # A SIGKILLed run never reaches its EXIT trap, so clean up the state it owns.
+    # These temp files are per-PID, so they are always ours to delete; the
+    # lockfile is not, and is left alone if a new run already claimed it.
+    rm -f "/tmp/putio_movies_added_$pid" "/tmp/putio_tv_added_$pid" \
+          "$MEDIA_MOUNT_STATE_DIR/mount_dead.$pid" 2>/dev/null
+    if ! release_lock_of "$pid"; then
+        warn "A new run has already taken the lockfile — leaving it alone."
+    fi
+    ok "Sync stopped"
+    info "  Partially downloaded files are resumed on the next run."
+    if ! is_paused; then
+        info "  Cron will start a fresh run on schedule — '$PROG pause 1h' if that's not what you want."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+# API keys and tokens are masked unless --show-secrets is given, so `config list`
+# is safe to paste into an issue or a chat.
+is_secret_key() {
+    case "$1" in
+        *KEY|*TOKEN|*PASSWORD|*SECRET|*_KEY_*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+mask_value() {
+    local v=$1
+    if [ ${#v} -le 4 ]; then printf '****'; else printf '****%s' "${v: -4}"; fi
+}
+
+# Extracts the value from an assignment line: drops the key, the surrounding
+# quotes and any trailing inline comment. The shipped config puts comments on
+# the same line as several settings ("# Replace with your actual key"), and
+# without this they end up displayed — and masked — as if they were the value.
+value_of() {
+    local rhs=${1#*=}
+    rhs=${rhs#"${rhs%%[![:space:]]*}"}
+    case "$rhs" in
+        \"*) rhs=${rhs#\"}; rhs=${rhs%%\"*} ;;
+        \'*) rhs=${rhs#\'}; rhs=${rhs%%\'*} ;;
+        *)   rhs=${rhs%%#*}; rhs=${rhs%%[[:space:]]*} ;;
+    esac
+    printf '%s' "$rhs"
+}
+
+config_lines() { grep -E '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$CONFIG_PATH"; }
+
+cmd_config() {
+    local sub="${1:-list}"
+    [ $# -gt 0 ] && shift
+
+    case "$sub" in
+        path) printf '%s\n' "$CONFIG_PATH" ;;
+
+        list|show)
+            local show_secrets=0
+            [ "${1:-}" = "--show-secrets" ] && show_secrets=1
+            printf '%s%s%s\n\n' "$C_DIM" "$CONFIG_PATH" "$C_RESET"
+            config_lines | while IFS= read -r line; do
+                local key value
+                key=${line%%=*}; key=$(printf '%s' "$key" | tr -d '[:space:]')
+                value=$(value_of "$line")
+                if [ "$show_secrets" -eq 0 ] && is_secret_key "$key"; then
+                    value=$(mask_value "$value")
+                fi
+                printf '  %-32s %s\n' "$key" "$value"
+            done
+            [ "$show_secrets" -eq 0 ] &&
+                printf '\n  %ssecrets masked — pass --show-secrets to reveal%s\n' "$C_DIM" "$C_RESET"
+            ;;
+
+        get)
+            local key="${1:-}"
+            [ -n "$key" ] || die "usage: $PROG config get KEY"
+            local line
+            line=$(config_lines | grep -E "^[[:space:]]*${key}=" | head -1) ||
+                die "Key not set in $CONFIG_PATH: $key"
+            [ -n "$line" ] || die "Key not set in $CONFIG_PATH: $key"
+            printf '%s\n' "$(value_of "$line")"
+            ;;
+
+        set)
+            local key="${1:-}" value="${2:-}"
+            [ -n "$key" ] || die "usage: $PROG config set KEY VALUE"
+            [ $# -ge 2 ] || die "usage: $PROG config set KEY VALUE"
+            [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "Invalid config key: $key"
+            config_set "$key" "$value"
+            ;;
+
+        unset)
+            local key="${1:-}"
+            [ -n "$key" ] || die "usage: $PROG config unset KEY"
+            config_unset "$key"
+            ;;
+
+        edit) config_edit ;;
+
+        -h|--help|help) usage_config ;;
+        *) die "config: unknown subcommand '$sub' (see $PROG config --help)" ;;
+    esac
+}
+
+# Rewrites one assignment in place, preserving the file's comments and ordering.
+# The result is syntax-checked before it replaces the live config, because a
+# broken config file means every cron run from here on exits at startup.
+config_set() {
+    local key=$1 value=$2
+    local old_line active_line commented_line target_line
+    old_line=$(config_lines | grep -E "^[[:space:]]*${key}=" | head -1)
+
+    # Values are written inside double quotes with plain `$VAR` left intact:
+    # config values like STAGING_DIR="$HOME/.putio_staging" are meant to expand
+    # at load time. Command substitution is not — both spellings are escaped, or
+    # the value would run a command every time a run sources the config, and
+    # `bash -n` below cannot catch that because the syntax is perfectly valid.
+    local new_line
+    new_line="${key}=\"$(printf '%s' "$value" |
+        sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$(/\\$(/g')\""
+
+    active_line=$(grep -nE "^[[:space:]]*${key}=" "$CONFIG_PATH" | head -1 | cut -d: -f1)
+    # A key that only exists commented out (the config ships several documented
+    # examples that way) is uncommented in place rather than duplicated below.
+    commented_line=$(grep -nE "^[[:space:]]*#[[:space:]]*${key}=" "$CONFIG_PATH" | head -1 | cut -d: -f1)
+    target_line="${active_line:-$commented_line}"
+
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/putioctl_config.XXXXXX") || die "Failed to create temp file"
+
+    if [ -n "$target_line" ]; then
+        NEW_LINE="$new_line" awk -v n="$target_line" \
+            '{ if (NR == n) print ENVIRON["NEW_LINE"]; else print }' "$CONFIG_PATH" > "$tmp"
+    else
+        cat "$CONFIG_PATH" > "$tmp"
+        {
+            printf '\n# Added by %s on %s\n' "$PROG" "$(date '+%Y-%m-%d %H:%M:%S')"
+            printf '%s\n' "$new_line"
+        } >> "$tmp"
+    fi
+
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "Refusing to write: the resulting config is not valid bash"
+    fi
+
+    # .bak is the undo for the last real config change, and there is only one
+    # slot. A display-only write (`quiet`, which sets CONFIG_SET_SILENT) must
+    # not spend it; the result is still syntax-checked above either way.
+    if [ "${CONFIG_SET_SILENT:-0}" != "1" ]; then
+        cp "$CONFIG_PATH" "$CONFIG_PATH.bak" || die "Failed to back up $CONFIG_PATH"
+    fi
+    cat "$tmp" > "$CONFIG_PATH" || die "Failed to write $CONFIG_PATH"
+    rm -f "$tmp"
+
+    # `quiet` writes through this too, where the usual three-line report (old
+    # value, backup path, "a run is in progress") is noise for a display
+    # setting the running sync does not read.
+    [ "${CONFIG_SET_SILENT:-0}" = "1" ] && return 0
+
+    local shown_old shown_new
+    if is_secret_key "$key"; then
+        shown_old=$([ -n "$old_line" ] && mask_value "$(value_of "$old_line")" || printf '(unset)')
+        shown_new=$(mask_value "$value")
+    else
+        shown_old=$([ -n "$old_line" ] && printf '"%s"' "$(value_of "$old_line")" || printf '(unset)')
+        shown_new="\"$value\""
+    fi
+
+    ok "$key: $shown_old -> $shown_new"
+    [ -z "$old_line" ] && [ -z "$commented_line" ] &&
+        warn "$key was not previously set — check the spelling if this was meant to change existing behaviour."
+    info "  ${C_DIM}backup: $CONFIG_PATH.bak${C_RESET}"
+
+    local pid
+    if pid=$(running_pid); then
+        warn "A sync is running (PID $pid) — it keeps the old value until it finishes."
+    fi
+}
+
+# Comments the assignment out rather than deleting it, so the script falls back
+# to its built-in default and the previous value stays visible in the file.
+config_unset() {
+    local key=$1 line_no
+    line_no=$(grep -nE "^[[:space:]]*${key}=" "$CONFIG_PATH" | head -1 | cut -d: -f1)
+    [ -n "$line_no" ] || die "Key not set in $CONFIG_PATH: $key"
+
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/putioctl_config.XXXXXX") || die "Failed to create temp file"
+    awk -v n="$line_no" -v prog="$PROG" '{ if (NR == n) print "# unset by " prog ": " $0; else print }' \
+        "$CONFIG_PATH" > "$tmp"
+
+    bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; die "Refusing to write: result is not valid bash"; }
+    cp "$CONFIG_PATH" "$CONFIG_PATH.bak" || die "Failed to back up $CONFIG_PATH"
+    cat "$tmp" > "$CONFIG_PATH" || die "Failed to write $CONFIG_PATH"
+    rm -f "$tmp"
+    ok "$key unset — the script's built-in default applies from the next run."
+}
+
+config_edit() {
+    local editor="${VISUAL:-${EDITOR:-vi}}"
+    cp "$CONFIG_PATH" "$CONFIG_PATH.bak" || die "Failed to back up $CONFIG_PATH"
+    "$editor" "$CONFIG_PATH"
+    if ! bash -n "$CONFIG_PATH" 2>/dev/null; then
+        err "Edited config is not valid bash — restoring $CONFIG_PATH.bak"
+        cat "$CONFIG_PATH.bak" > "$CONFIG_PATH"
+        return 1
+    fi
+    ok "Config saved (backup at $CONFIG_PATH.bak)"
+}
+
+# ---------------------------------------------------------------------------
+# logs
+# ---------------------------------------------------------------------------
+
+cmd_logs() {
+    local lines=40 follow=0 pattern="" errors=0 hide_idle=0
+    hide_idle_enabled && hide_idle=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--lines)  shift; lines="${1:-40}" ;;
+            -f|--follow) follow=1 ;;
+            -g|--grep)   shift; pattern="${1:-}" ;;
+            --errors)    errors=1 ;;
+            --quiet|--hide-idle) hide_idle=1 ;;
+            --idle|--show-idle)  hide_idle=0 ;;
+            -h|--help)   usage_logs; return 0 ;;
+            *) die "logs: unknown option '$1' (see $PROG logs --help)" ;;
+        esac
+        shift
+    done
+
+    [ -f "$LOG_FILE" ] || die "Log file not found: $LOG_FILE"
+    [ "$errors" -eq 1 ] && pattern='\[(ERROR|WARN)\]'
+
+    # Both filters can apply at once (--errors alongside a quiet setting), so
+    # they compose as a chain rather than one pattern. `$buf` is unquoted on
+    # purpose: empty must expand to no argument at all, not to "".
+    filter_log() {
+        local buf=""
+        [ "${1:-}" = "-f" ] && buf="--line-buffered"
+        if [ "$hide_idle" -eq 1 ] && [ -n "$pattern" ]; then
+            grep -aEv $buf "$IDLE_LINE_RE" | grep -aE $buf "$pattern"
+        elif [ "$hide_idle" -eq 1 ]; then
+            grep -aEv $buf "$IDLE_LINE_RE"
+        elif [ -n "$pattern" ]; then
+            grep -aE $buf "$pattern"
+        else
+            cat
+        fi
+    }
+
+    if [ "$follow" -eq 1 ]; then
+        tail -n "$lines" -f "$LOG_FILE" | filter_log -f
+        return
+    fi
+
+    # Nothing to filter: tail the file itself rather than reading all of it to
+    # print the last few lines. A DEBUG-level log can be many megabytes.
+    if [ "$hide_idle" -eq 0 ] && [ -z "$pattern" ]; then
+        tail -n "$lines" "$LOG_FILE"
+        return
+    fi
+
+    # Filtered before the tail, so -n counts lines you can actually see. The
+    # result is buffered because an empty one needs explaining: a log of
+    # nothing but idle runs is the normal state of a quiet week, and printing
+    # nothing at all reads as a broken log.
+    local out status
+    out=$(filter_log < "$LOG_FILE" | tail -n "$lines")
+    status=$?
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+    elif [ "$hide_idle" -eq 1 ] && [ -z "$pattern" ] && [ "$(idle_line_count)" -gt 0 ]; then
+        # stderr: stdout stays log lines only, so a redirected `putioctl logs`
+        # is empty when there is nothing to show, as it was before.
+        warn "Nothing but idle runs in the log — $(idle_line_count) line(s) hidden by '$PROG quiet'. Show them with '$PROG logs --idle'."
+    fi
+
+    # A pattern that matched nothing still exits non-zero, the way the bare
+    # grep did before this command buffered its output — scripts gate on it.
+    # The quiet filter alone does not: hiding idle runs is not "no match".
+    [ -n "$pattern" ] && return "$status"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# quiet — hide the one-line "nothing to do" runs
+# ---------------------------------------------------------------------------
+
+cmd_quiet() {
+    local action="${1:-toggle}" current=false want
+    case "$action" in -h|--help) usage_quiet; return 0 ;; esac
+    hide_idle_enabled && current=true
+
+    case "$action" in
+        toggle)             [ "$current" = true ] && want=false || want=true ;;
+        on|hide|yes|true)   want=true ;;
+        off|show|no|false)  want=false ;;
+        status)
+            if [ "$current" = true ]; then
+                info "Quiet is ${C_GREEN}on${C_RESET} — idle \"nothing to do\" runs are hidden."
+            else
+                info "Quiet is off — every completed run is shown."
+            fi
+            local total=0
+            [ -f "$LOG_FILE" ] && total=$(wc -l < "$LOG_FILE" | tr -d ' ')
+            info "  ${C_DIM}$(idle_line_count) of $total lines in the log are idle runs${C_RESET}"
+            return 0 ;;
+        *) die "quiet: expected on, off, status, or nothing at all (see $PROG quiet --help)" ;;
+    esac
+
+    if [ "$want" = "$current" ]; then
+        info "Quiet is already $([ "$want" = true ] && echo on || echo off) — nothing changed."
+        return 0
+    fi
+
+    CONFIG_SET_SILENT=1 config_set LOGS_HIDE_IDLE "$want"
+    if [ "$want" = true ]; then
+        ok "Quiet on — idle \"nothing to do\" runs are hidden from '$PROG logs' and the console."
+        info "  ${C_DIM}$(idle_line_count) such line(s) hidden right now · show them again with '$PROG quiet off'${C_RESET}"
+    else
+        ok "Quiet off — every completed run is shown again."
+    fi
+}
+
+# grep -c prints 0 and *exits 1* when nothing matches, so the count is captured
+# rather than relied on as a status.
+idle_line_count() {
+    local n=0
+    [ -f "$LOG_FILE" ] && n=$(grep -acE "$IDLE_LINE_RE" "$LOG_FILE" 2>/dev/null)
+    printf '%s' "${n:-0}"
+}
+
+# ---------------------------------------------------------------------------
+# deploy
+#
+# Copies the processor and this CLI from the repo to ~/Scripts, which is what
+# cron runs. The config is never copied: the repo copy carries placeholder API
+# keys, and overwriting the deployed one with it would break every run.
+# ---------------------------------------------------------------------------
+
+# Copies via a temp file in the destination directory and renames into place.
+# Overwriting a running bash script in place is genuinely unsafe — bash reads
+# the file as it executes, so a cron run that starts mid-copy would continue
+# reading at its old offset into new content. A rename swaps the directory
+# entry instead, leaving any in-flight run attached to the old inode.
+install_atomic() {
+    local src=$1 dest=$2 mode=${3:-755} tmp
+    tmp="$(dirname "$dest")/.$(basename "$dest").new.$$"
+    cp "$src" "$tmp" || die "Failed to copy $(basename "$src") into $(dirname "$dest")"
+    chmod "$mode" "$tmp"
+    mv -f "$tmp" "$dest" || { rm -f "$tmp"; die "Failed to install $dest"; }
+}
+
+# Installs the putio/ package a file at a time, rather than swapping the
+# directory. Swapping would mean the directory does not exist for an instant,
+# and an import that lands in that instant fails outright; a per-file rename
+# has the same in-flight safety as the scripts above and never leaves a gap.
+# Modules go in non-executable — they are imported, never run directly, and a
+# +x .py in a deployed tree invites someone to run it with the wrong python.
+#
+# Stale .py and .pyc files are pruned afterwards: a module deleted from the
+# repo would otherwise sit in ~/Scripts forever, and Python would happily keep
+# importing it. -B on the processor's side stops new bytecode appearing, but a
+# .pyc written by an interactive run before that flag existed still has to go.
+#
+# Only *.py is carried across — the package is code, with no data files by
+# design, and pruning is keyed on the same pattern.
+#
+# INSTALLED_MODULES is how the count gets out. Capturing the count from a
+# command substitution instead would put the whole function in a subshell,
+# where install_atomic's `die` exits only that subshell and a failed copy is
+# reported as a successful deploy.
+INSTALLED_MODULES=0
+# What counts as part of the package on disk: the modules, plus the recorded
+# API responses under tests/fixtures.
+#
+# The fixtures are not an optional extra. The suite ships inside the package
+# precisely so it can be run against the *deployed* tree — that is the only way
+# to confirm the copy cron uses is the copy that works — and a deploy that left
+# them behind would turn every phase 2 test into an error at ~/Scripts while
+# passing in the checkout. Both loops below use this, so a fixture deleted
+# upstream is also removed downstream rather than lingering.
+package_files() {
+    (cd "$1" && find . \( -name '*.py' -o -path './tests/fixtures/*' \) -type f \
+        | sed 's|^\./||' | sort)
+}
+
+install_package() {
+    local src_pkg=$1 dest_pkg=$2 rel dest_file
+    [ -d "$src_pkg" ] || return 1
+
+    INSTALLED_MODULES=0
+    while IFS= read -r rel; do
+        dest_file="$dest_pkg/$rel"
+        mkdir -p "$(dirname "$dest_file")" || die "Cannot create $(dirname "$dest_file")"
+        install_atomic "$src_pkg/$rel" "$dest_file" 644
+        case "$rel" in *.py) INSTALLED_MODULES=$((INSTALLED_MODULES + 1)) ;; esac
+    done < <(package_files "$src_pkg")
+
+    if [ -d "$dest_pkg" ]; then
+        while IFS= read -r rel; do
+            [ -f "$src_pkg/$rel" ] || rm -f "$dest_pkg/$rel"
+        done < <(package_files "$dest_pkg")
+        find "$dest_pkg" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null
+        find "$dest_pkg" -type d -empty -delete 2>/dev/null
+    fi
+}
+
+cmd_deploy() {
+    case "${1:-}" in -h|--help) usage_deploy; return 0 ;; esac
+
+    local dest_dir="$HOME/Scripts"
+
+    # Source is an explicit path, else the working directory when it looks like
+    # the checkout, else wherever this script lives. The middle case is what
+    # makes `putioctl deploy` work when putioctl is on PATH via a symlink: the
+    # user is standing in the repo, which is the copy they mean to deploy.
+    local src_dir="${1:-}"
+    if [ -z "$src_dir" ]; then
+        if [ -f "$PWD/putio_download_and_delete.sh" ] && [ -f "$PWD/putioctl" ]; then
+            src_dir="$PWD"
+        else
+            src_dir="$SELF_DIR"
+        fi
+    fi
+    src_dir="$(cd -P "$src_dir" 2>/dev/null && pwd)" || die "No such directory: ${1:-$SELF_DIR}"
+
+    local src_script="$src_dir/putio_download_and_delete.sh"
+    [ -f "$src_script" ] || die "No processor script in $src_dir — run deploy from the repo, or pass its path."
+    if [ "$src_dir" = "$dest_dir" ]; then
+        die "Source and destination are both $dest_dir — run deploy from the repo checkout, or pass its path."
+    fi
+    mkdir -p "$dest_dir" || die "Cannot create $dest_dir"
+
+    local pid
+    if pid=$(running_pid); then
+        die "A sync is running (PID $pid) — stop it first with '$PROG stop', then deploy."
+    fi
+
+    install_atomic "$src_script" "$dest_dir/putio_download_and_delete.sh"
+    ok "Deployed putio_download_and_delete.sh -> $dest_dir"
+
+    if [ -f "$src_dir/putioctl" ]; then
+        install_atomic "$src_dir/putioctl" "$dest_dir/putioctl"
+        ok "Deployed putioctl -> $dest_dir"
+        # The public name, as a relative symlink so it follows the file it names.
+        ln -sfn putioctl "$dest_dir/drovie-downloader" &&
+            ok "Linked drovie-downloader -> putioctl"
+    fi
+    # The Python package. Absent is not an error on an older checkout: since
+    # phase 1 the download path does call into it, but only for junk
+    # classification, and is_junk_file falls back to its own rules when the
+    # call fails. So a warning is still the right volume — but say so, because
+    # the alternative is a deployed processor whose putio_python silently
+    # returns nothing and a fallback nobody knows is running.
+    if [ -d "$src_dir/putio" ]; then
+        install_package "$src_dir/putio" "$dest_dir/putio"
+        ok "Deployed putio/ -> $dest_dir ($INSTALLED_MODULES module(s))"
+    else
+        warn "No putio/ package in $src_dir — Python components won't be available."
+    fi
+
+    if [ -f "$src_dir/putioctl_tui.py" ]; then
+        install_atomic "$src_dir/putioctl_tui.py" "$dest_dir/putioctl_tui.py"
+        ok "Deployed putioctl_tui.py -> $dest_dir"
+    else
+        warn "putioctl_tui.py not found in $src_dir — the console won't be available."
+    fi
+    # The status daemon runs from the same directory. Replacing the file does
+    # not restart it — launchd is holding the old one until it is kicked — so
+    # say so rather than leaving the user to wonder why the JSON didn't change.
+    if [ -f "$src_dir/putio-statusd" ]; then
+        install_atomic "$src_dir/putio-statusd" "$dest_dir/putio-statusd"
+        ok "Deployed putio-statusd -> $dest_dir"
+        if [ -f "$src_dir/putio-statusd-run" ]; then
+            install_atomic "$src_dir/putio-statusd-run" "$dest_dir/putio-statusd-run"
+            ok "Deployed putio-statusd-run -> $dest_dir"
+        fi
+        # Two different restarts, and picking the wrong one fails silently.
+        # kickstart re-execs from the plist launchd already holds in memory, so
+        # it applies a changed *script* and ignores a changed *plist* — it
+        # reports success either way. Deploy does not install the plist (that
+        # means taking the daemon down, which is a human's call), so the least
+        # it can do is refuse to recommend the restart that would not work.
+        statusd_plist_state "$src_dir/$STATUSD_LABEL.plist"
+        case $? in
+            1)  warn "The installed plist differs from $src_dir/$STATUSD_LABEL.plist."
+                info "  ${C_DIM}kickstart will NOT apply it — launchd re-execs from the copy it holds:${C_RESET}"
+                info "  ${C_DIM}  $PROG statusd reinstall${C_RESET}"
+                ;;
+            2)  info "  ${C_DIM}statusd is not installed — '$PROG statusd reinstall' sets it up.${C_RESET}"
+                ;;
+            *)  if statusd_loaded; then
+                    info "  ${C_DIM}statusd is loaded — restart it to pick this up:${C_RESET}"
+                    info "  ${C_DIM}  launchctl kickstart -k $STATUSD_DOMAIN/$STATUSD_LABEL${C_RESET}"
+                fi
+                ;;
+        esac
+    fi
+    info "  ${C_DIM}Config not copied — $dest_dir/.putio_config keeps its live values.${C_RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# statusd
+#
+# Installing the plist is deliberately NOT part of `deploy`: it means taking
+# the status API down, and a routine script copy should not be able to do
+# that. It is a command instead of the four lines it used to be in PUTIOCTL.md
+# because one of those lines is a wait loop that reads like decoration, and the
+# first thing a reader in a hurry does with a snippet is shorten it.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# setup-putio: turn a put.io OAuth token into the rclone remote REMOTE names.
+#
+# rclone's own `config` walks a browser OAuth flow, which a headless server
+# cannot complete. put.io hands every account a long-lived OAuth token instead
+# (put.io › Settings › API › your app › "OAuth token"), and rclone accepts one
+# directly — so this writes the remote non-interactively and then proves it by
+# listing the folder, creating it if it does not exist yet.
+#
+# The container runs this on every start when PUTIO_TOKEN is set.
+# ---------------------------------------------------------------------------
+
+cmd_setup_putio() {
+    case "${1:-}" in -h|--help) usage_setup_putio; return 0 ;; esac
+    local token="${1:-${PUTIO_TOKEN:-}}"
+    local rclone="${RCLONE_CMD:-$(command -v rclone 2>/dev/null)}"
+    [ -n "$rclone" ] && [ -x "$rclone" ] || die "rclone not found — install it first (https://rclone.org/install/)."
+
+    local remote="${REMOTE:-putio:Drovie/}"
+    case "$remote" in *:*) ;; *) die "REMOTE='$remote' does not name an rclone remote (expected e.g. putio:Drovie/)." ;; esac
+    local name="${remote%%:*}" folder="${remote#*:}"
+
+    if [ -z "$token" ]; then
+        [ -t 0 ] || die "Pass the token as an argument or in PUTIO_TOKEN."
+        printf 'put.io OAuth token (put.io › Settings › API): '
+        IFS= read -rs token; echo
+    fi
+    token="$(printf '%s' "$token" | tr -d '[:space:]')"
+    [ -n "$token" ] || die "No token given."
+    case "$token" in *[!A-Za-z0-9_-]*) die "That doesn't look like a put.io OAuth token (letters and digits only)." ;; esac
+
+    # The zero expiry is put.io's own answer: its tokens do not expire, and it
+    # tells rclone's OAuth layer never to try refreshing this one.
+    local json
+    json=$(printf '{"access_token":"%s","token_type":"Bearer","expiry":"0001-01-01T00:00:00Z"}' "$token")
+    if "$rclone" listremotes 2>/dev/null | grep -qx "$name:"; then
+        "$rclone" config update "$name" token "$json" --non-interactive >/dev/null ||
+            die "rclone could not update the '$name' remote."
+        ok "Updated the rclone remote '$name'"
+    else
+        "$rclone" config create "$name" putio token "$json" --non-interactive >/dev/null ||
+            die "rclone could not create the '$name' remote."
+        ok "Created the rclone remote '$name'"
+    fi
+
+    if ! "$rclone" lsf --max-depth 1 "$name:" >/dev/null 2>&1; then
+        die "put.io refused the token. Check it at put.io › Settings › API and run this again."
+    fi
+    ok "put.io accepted the token"
+
+    if [ -n "${folder%/}" ]; then
+        if "$rclone" lsf --dirs-only --max-depth 1 "$name:" 2>/dev/null | grep -qxF "${folder%/}/"; then
+            ok "Found the folder ${folder%/} on put.io"
+        else
+            "$rclone" mkdir "$name:${folder%/}" || die "Could not create ${folder%/} on put.io."
+            ok "Created the folder ${folder%/} on put.io"
+        fi
+        info "  In Drovie, open Settings › Download clients › put.io and pick this folder"
+        info "  (or press \"Use a Drovie folder\"), so Drovie's transfers land where this looks."
+    else
+        warn "REMOTE is the whole put.io account: everything in it will be downloaded and then deleted."
+    fi
+}
+
+usage_setup_putio() {
+    cat <<EOF
+$PROG setup-putio [TOKEN] — connect your put.io account
+
+Creates (or updates) the rclone remote named by REMOTE — "putio" for the default
+putio:Drovie/ — from a put.io OAuth token, checks put.io accepts it, and creates
+the folder if it doesn't exist. No browser needed.
+
+Get the token at put.io › Settings › API: create an app (any name) and copy its
+"OAuth token". Pass it as the argument, in PUTIO_TOKEN, or type it at the prompt.
+
+The Docker image runs this at every start when PUTIO_TOKEN is set.
+EOF
+}
+
+cmd_statusd() {
+    case "${1:-}" in
+        -h|--help|"") usage_statusd; return 0 ;;
+    esac
+    local sub="$1"; shift
+    case "$sub" in
+        reinstall|install) statusd_reinstall "$@" ;;
+        *) err "Unknown statusd subcommand: $sub"; echo; usage_statusd; return 1 ;;
+    esac
+}
+
+statusd_reinstall() {
+    local src_dir="${1:-}"
+    if [ -z "$src_dir" ]; then
+        if [ -f "$PWD/$STATUSD_LABEL.plist" ]; then src_dir="$PWD"; else src_dir="$SELF_DIR"; fi
+    fi
+    src_dir="$(cd -P "$src_dir" 2>/dev/null && pwd)" || die "No such directory: ${1:-$SELF_DIR}"
+
+    local src="$src_dir/$STATUSD_LABEL.plist"
+    [ -f "$src" ] || die "No $STATUSD_LABEL.plist in $src_dir — run this from the repo, or pass its path."
+
+    mkdir -p "$(dirname "$STATUSD_PLIST")" || die "Cannot create $(dirname "$STATUSD_PLIST")"
+
+    # Temp file and rename, like every other install here: launchd reads this
+    # path at bootstrap, and a half-written plist is a job that will not load.
+    # Linted before it is moved, so a bad substitution is caught while the old
+    # working copy is still in place.
+    local tmp
+    tmp=$(mktemp "$STATUSD_PLIST.XXXXXX") || die "Cannot write beside $STATUSD_PLIST"
+    sed "s|__HOME__|$HOME|g" "$src" > "$tmp" || { rm -f "$tmp"; die "Failed to write $tmp"; }
+    plutil -lint "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "Generated plist is not valid — left $src unchanged."; }
+    mv "$tmp" "$STATUSD_PLIST" || { rm -f "$tmp"; die "Failed to install $STATUSD_PLIST"; }
+    ok "Installed $STATUSD_PLIST"
+
+    # Retire the job from before the rename. Both would bind the same port, so
+    # the new one cannot come up while the old one holds it.
+    local old_plist="$HOME/Library/LaunchAgents/$STATUSD_OLD_LABEL.plist"
+    if launchctl print "$STATUSD_DOMAIN/$STATUSD_OLD_LABEL" >/dev/null 2>&1; then
+        launchctl bootout "$STATUSD_DOMAIN/$STATUSD_OLD_LABEL" >/dev/null 2>&1
+        local m=0
+        while launchctl print "$STATUSD_DOMAIN/$STATUSD_OLD_LABEL" >/dev/null 2>&1; do
+            m=$(( m + 1 ))
+            [ "$m" -gt 100 ] && die "Timed out after 10s waiting for $STATUSD_OLD_LABEL to unload."
+            sleep 0.1
+        done
+        ok "Unloaded the pre-rename job $STATUSD_OLD_LABEL"
+    fi
+    if [ -f "$old_plist" ]; then
+        rm -f "$old_plist" && ok "Removed $old_plist"
+    fi
+
+    # bootout returns before launchd has finished tearing the job down, and a
+    # bootstrap landing in that window fails with "Input/output error" — after
+    # the old job is already gone, so the daemon stays down. Waiting for the
+    # job to actually disappear is the entire reason this is a command.
+    if statusd_loaded; then
+        launchctl bootout "$STATUSD_DOMAIN/$STATUSD_LABEL" >/dev/null 2>&1
+        local n=0
+        while statusd_loaded; do
+            n=$(( n + 1 ))
+            [ "$n" -gt 100 ] && die "Timed out after 10s waiting for $STATUSD_LABEL to unload."
+            sleep 0.1
+        done
+        ok "Unloaded the running job (waited $(( n / 10 )).$(( n % 10 ))s)"
+    fi
+
+    local out
+    if ! out=$(launchctl bootstrap "$STATUSD_DOMAIN" "$STATUSD_PLIST" 2>&1); then
+        err "bootstrap failed: ${out:-no output}"
+        info "  ${C_DIM}gui/<uid> needs a real login session. Over a plain ssh connection${C_RESET}"
+        info "  ${C_DIM}with nobody logged in at the console, bootstrap fails like this.${C_RESET}"
+        info "  ${C_DIM}The plist is installed — rerun this from a console session.${C_RESET}"
+        return 1
+    fi
+    ok "Bootstrapped $STATUSD_LABEL"
+
+    # Verify rather than assume. A successful bootstrap means launchd accepted
+    # the job, not that the daemon bound its port and can answer — a bad
+    # PYTHON_BIN or a taken port shows up only here.
+    local port
+    port=$(awk '/<string>--port<\/string>/ { getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit }' "$STATUSD_PLIST")
+    case "${port:-}" in ''|*[!0-9]*) port=9494 ;; esac
+
+    command -v curl >/dev/null 2>&1 || { warn "curl not found — skipping the health check."; return 0; }
+    local n=0
+    while [ "$n" -lt 50 ]; do
+        if curl -fsS --max-time 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
+            ok "Answering on 127.0.0.1:$port"
+            return 0
+        fi
+        n=$(( n + 1 ))
+        sleep 0.1
+    done
+    warn "Bootstrapped, but nothing answered on 127.0.0.1:$port within 5s."
+    info "  ${C_DIM}Check $HOME/Scripts/putio-statusd.log${C_RESET}"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+${C_BOLD}$PROG${C_RESET} — control the put.io -> Plex sync
+
+${C_BOLD}USAGE${C_RESET}
+  $PROG [global options] <command> [options]
+
+${C_BOLD}COMMANDS${C_RESET}
+  (none)                 Open the interactive console — live log above, prompt below
+  tui                    Same thing, named explicitly
+  status                 Show pause state, current run, schedule and storage
+  sync [-f] [--force]    Start a sync now (-f follows the log)
+  pause [DURATION]       Hold off scheduled runs (e.g. 30m, 2h, 1d; blank = forever)
+  resume                 Re-enable scheduled runs
+  stop                   Terminate the run in progress
+  progress [-w]          Show a bar for each download in flight (-w to watch)
+  config <sub>           list | get KEY | set KEY VALUE | unset KEY | edit | path
+  logs [-n N] [-f]       Show the processor log (--errors for problems only)
+  quiet [on|off]         Toggle hiding the idle "nothing to do" runs in the log
+  deploy                 Copy the repo scripts to ~/Scripts (never the config)
+  statusd <sub>          reinstall — install the launchd plist and restart the daemon
+  setup-putio [TOKEN]    Connect your put.io account (creates the rclone remote)
+  version                Print the $PROG version
+
+${C_BOLD}GLOBAL OPTIONS${C_RESET}
+  --script PATH          Processor script to control (default: ~/Scripts copy)
+  --config PATH          Config file to read/edit (default: beside the script)
+  --repo                 Act on the repo copy beside $PROG instead of ~/Scripts
+
+${C_BOLD}EXAMPLES${C_RESET}
+  $PROG                              # interactive console
+  $PROG status
+  $PROG sync --follow
+  $PROG progress -w                  # live bars, refreshed until Ctrl-C
+  $PROG pause 2h -m "hosting movie night"
+  $PROG config set RCLONE_BWLIMIT 20M
+  $PROG logs -f --errors
+  $PROG quiet                        # hide idle runs (run again to unhide)
+  $PROG statusd reinstall            # after editing app.drovie.downloader.statusd.plist
+
+Run '$PROG <command> --help' for details on a command.
+EOF
+}
+
+usage_tui() {
+    cat <<EOF
+$PROG tui — interactive console (what bare '$PROG' opens)
+
+The processor log streams in the upper pane; the prompt at the bottom takes the
+same commands as the CLI (status, sync, pause, resume, stop, config ...), with
+their output shown inline. A status bar tracks pause state, the running PID and
+the next scheduled run.
+
+  ↑ / ↓        command history          Tab       complete a command
+  PgUp/PgDn    scroll the log           Ctrl-L    redraw + back to following
+  clear        drop command output, keeping the log (clear all wipes the pane)
+  quit         leave (the sync keeps running; Ctrl-C twice does the same)
+
+Needs python3 and a terminal; falls back to 'status' when either is missing.
+Set PUTIOCTL_NO_TUI=1 to make bare '$PROG' print status instead.
+EOF
+}
+
+usage_sync() {
+    cat <<EOF
+$PROG sync — start a sync immediately
+
+  -f, --follow   Stream the log until the run finishes (Ctrl-C detaches only)
+      --force    Run even while paused (the pause stays in effect afterwards)
+
+Refuses to start a second run while one is in progress; the processor's own
+lockfile enforces the same thing for cron.
+EOF
+}
+
+usage_pause() {
+    cat <<EOF
+$PROG pause [DURATION] — hold off scheduled runs
+
+  DURATION           30s, 45m, 2h, 3d — a bare number means minutes.
+                     Omit it to pause until you run '$PROG resume'.
+  -m, --message TXT  Note stored with the pause and shown in status/logs
+
+Writes a pause marker the processor checks at startup; the crontab is left
+alone, and a timed pause clears itself when it expires. A sync already in
+progress keeps running — use '$PROG stop' for that.
+EOF
+}
+
+usage_resume() { echo "$PROG resume — remove the pause marker so scheduled runs proceed"; }
+
+usage_status() {
+    cat <<EOF
+$PROG status — pause state, running PID, last run, schedule and storage
+
+USAGE
+  $PROG status [--json]
+
+OPTIONS
+      --json   Print the whole picture as one JSON object instead of drawing it
+
+The JSON form is what putio-statusd serves to Drovie, and carries a
+\`schema\` field that is bumped only when a field changes meaning. It includes
+the in-flight transfers, so one call gives a coherent snapshot rather than two
+that can disagree about whether a download just finished.
+
+It can block: a transfer in its copy phase is measured by stat'ing the media
+share, and free space runs df against it, both of which sit in the kernel when
+the NAS drops. Poll it from a thread you can abandon, never from a request
+handler.
+EOF
+}
+
+usage_progress() {
+    cat <<EOF
+$PROG progress — show a progress bar for each download in flight
+
+USAGE
+  $PROG progress [-w|--watch] [-n SECONDS]
+
+OPTIONS
+  -w, --watch          Redraw until Ctrl-C instead of printing once
+  -n, --interval SEC   Redraw every SEC seconds (implies --watch, default 2)
+      --json           Print the same transfers as JSON, once, and exit
+
+The numbers come from the running processor, which publishes them under
+PROGRESS_STATE_DIR (default /tmp/putio_progress) as each transfer moves. That
+makes this safe to point at a run cron started: it reads that state, and never
+touches the transfer. Downloads show rclone's own byte count, speed and ETA; the
+final copy onto the media share is a plain cp, so it is measured by the size of
+the file appearing at the far end and shows no speed.
+
+Bars refresh at RCLONE_STATS_INTERVAL (default 5s), so a faster -n than that
+redraws the same numbers.
+EOF
+}
+
+usage_stop() {
+    cat <<EOF
+$PROG stop — terminate the sync in progress
+
+  -t, --timeout N   Seconds to wait after SIGTERM before SIGKILL (default 30)
+
+Signals the processor and every rclone child it spawned, then clears the
+lockfile. Partial downloads resume on the next run. This does not pause the
+schedule — cron will start a fresh run unless you pause too.
+EOF
+}
+
+usage_config() {
+    cat <<EOF
+$PROG config — inspect and change configuration
+
+  list [--show-secrets]   Show all settings (API keys masked by default)
+  get KEY                 Print one value
+  set KEY VALUE           Change one value, preserving comments and order
+  unset KEY               Comment a setting out so its default applies
+  edit                    Open the config in \$EDITOR, validated on save
+  path                    Print the config file being used
+
+Edits go to the config the scheduled script reads, back it up to
+.putio_config.bak first, and are rejected if the result isn't valid bash.
+Changes apply to the next run; a sync already in progress keeps its old values.
+EOF
+}
+
+usage_logs() {
+    cat <<EOF
+$PROG logs — show the processor log
+
+  -n, --lines N    Number of lines (default 40)
+  -f, --follow     Stream new lines as they are written
+  -g, --grep PAT   Only lines matching an extended regex
+      --errors     Shorthand for warnings and errors only
+      --quiet      Hide idle "nothing to do" runs, just for this command
+      --idle       Show them, overriding '$PROG quiet on'
+
+Whether idle runs are hidden by default is the '$PROG quiet' setting; the
+two options above override it for one invocation.
+EOF
+}
+
+usage_quiet() {
+    cat <<EOF
+$PROG quiet [on|off|status] — hide idle runs in the log
+
+Cron runs every few minutes and most runs find nothing to do, each leaving one
+line like:
+
+  [2026-08-14 15:45:48] [INFO] === Script completed successfully — nothing to do (2s) ===
+
+Quiet filters those out of '$PROG logs' and the console's log pane, leaving
+the runs that actually downloaded, organised or failed. Nothing is deleted —
+the lines stay in the log file, and '$PROG logs --idle' shows them anyway.
+
+  (no argument)   Toggle
+  on / off        Set it explicitly
+  status          Report the setting and how many idle lines the log holds
+
+Stored as LOGS_HIDE_IDLE in the config, so it persists across runs. The
+processor itself never reads it — this only affects what you are shown.
+EOF
+}
+
+usage_statusd() {
+    cat <<EOF
+$PROG statusd reinstall [PATH] — install the launchd plist and restart the daemon
+
+Substitutes __HOME__ into app.drovie.downloader.statusd.plist, installs it to
+~/Library/LaunchAgents, unloads any running job, waits for launchd to finish
+tearing it down, bootstraps the new one and checks that it answers.
+
+Use this after editing the plist. \`$PROG deploy\` does not install it —
+applying a plist means taking the status API down, which should be a decision
+rather than a side effect of copying scripts — and \`launchctl kickstart\` does
+not apply it either: kickstart re-execs the job from the copy launchd already
+holds in memory, so a plist edit is silently ignored and the restart still
+reports success. Deploy warns when the two have drifted.
+
+Source is PATH if given, otherwise the current directory when it holds the
+plist, otherwise the directory $PROG itself lives in.
+
+Needs a real login session: launchctl bootstrap into gui/<uid> fails over a
+plain ssh connection with nobody logged in at the console.
+EOF
+}
+
+usage_deploy() {
+    cat <<EOF
+$PROG deploy [PATH] — copy the scripts to ~/Scripts
+
+Copies putio_download_and_delete.sh, putioctl and putioctl_tui.py into
+~/Scripts (the location cron runs) and makes them executable. The config is
+deliberately not copied. Refuses to run while a sync is in progress.
+
+Source is PATH if given, otherwise the current directory when it holds the
+scripts, otherwise the directory $PROG itself lives in — so this works from
+the repo even when $PROG is on \$PATH via a symlink.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+main() {
+    # Global options may appear before the command.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --script) shift; SCRIPT_PATH="${1:-}" ;;
+            --config) shift; CONFIG_PATH="${1:-}" ;;
+            --repo)   USE_REPO=1 ;;
+            -h|--help) usage; return 0 ;;
+            -v|--version) printf '%s %s\n' "$PROG" "$PUTIOCTL_VERSION"; return 0 ;;
+            *) break ;;
+        esac
+        shift
+    done
+
+    # Bare `putioctl` opens the console. Without a terminal (piped, cron, a
+    # script) there is nothing to drive it, so fall back to printing status —
+    # which is what a non-interactive caller wanted anyway.
+    local cmd="${1:-}"
+    if [ -z "$cmd" ]; then
+        if [ -t 0 ] && [ -t 1 ] && [ "${PUTIOCTL_NO_TUI:-0}" != "1" ]; then
+            cmd="tui"
+        else
+            cmd="status"
+        fi
+    fi
+    [ $# -gt 0 ] && shift
+
+    case "$cmd" in
+        help|-h|--help) usage; return 0 ;;
+        version|-v|--version) printf '%s %s\n' "$PROG" "$PUTIOCTL_VERSION"; return 0 ;;
+    esac
+
+    resolve_paths
+    load_config
+
+    case "$cmd" in
+        tui|console) cmd_tui "$@" ;;
+        status)  cmd_status "$@" ;;
+        sync|run|now) cmd_sync "$@" ;;
+        pause)   cmd_pause "$@" ;;
+        resume|unpause) cmd_resume "$@" ;;
+        stop|cancel|kill) cmd_stop "$@" ;;
+        progress|transfers) cmd_progress "$@" ;;
+        config)  cmd_config "$@" ;;
+        logs|log) cmd_logs "$@" ;;
+        quiet|hide-idle) cmd_quiet "$@" ;;
+        deploy)  cmd_deploy "$@" ;;
+        statusd) cmd_statusd "$@" ;;
+        setup-putio|setup) cmd_setup_putio "$@" ;;
+        *) err "Unknown command: $cmd"; echo; usage; return 1 ;;
+    esac
+}
+
+main "$@"

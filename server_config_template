@@ -1,0 +1,182 @@
+# Put.io Download Script Configuration
+# Copy this to ~/.putio_config and customize the values
+
+# The put.io folder to download from — the one Drovie adds transfers to
+# (Drovie: Settings › Download client › put.io; "Use a Drovie folder" there sets it to Drovie). Everything downloaded from it is
+# deleted from put.io afterwards, so never point this at the account root
+# ("putio:") unless that is really what you want.
+REMOTE="putio:Drovie/"
+
+# Directory paths (adjust these for your system). MOVIE_LIBRARY and TV_LIBRARY
+# are the folders your Plex Movies and TV libraries point at.
+LOCAL_DIR="/srv/media/downloads"
+MOVIE_LIBRARY="/srv/media/Movies"
+TV_LIBRARY="/srv/media/TV"
+UNMATCHED_DIR="/srv/media/Unmatched"
+
+# Log file location
+LOG_FILE="$HOME/Scripts/putio_download_and_delete.log"
+
+# Lock file location
+LOCKFILE="/tmp/putio_download_and_delete.lock"
+
+# Pause marker. While this file exists the script exits at startup without
+# downloading anything, which is how `putioctl pause` holds off scheduled runs
+# without touching the crontab. Deliberately not in /tmp: a pause should
+# survive a reboot rather than quietly lapse.
+PAUSE_FILE="$HOME/.putio_paused"
+
+# RATE_LIMIT_FILE is gone as of phase 5 of the Python port. The TMDb window was
+# file-backed because more than one process in a run made TMDb calls; the run is
+# one process now, so the window is a variable. A config that still sets it is
+# harmless — the shim sources it and does not pass it on — but it does nothing.
+
+# API Configuration
+TMDB_API_KEY="TMDB_API_KEY"  # Replace with your actual key
+
+# Plex configuration
+PLEX_URL="http://localhost:32400"
+PLEX_TOKEN="PLEX_TOKEN"  # Replace with your actual token
+PLEX_MOVIE_LIBRARY_ID=""
+PLEX_TV_LIBRARY_ID=""
+
+# Drovie webhook, called after each Plex scan so Drovie marks requests
+# available right away instead of at its next poll. Use Drovie's address plus
+# /api/webhooks/plex-check, and the key from Drovie's settings. Leave both empty
+# to disable. (The old names PLEX_REQUEST_WEBHOOK_URL/_KEY still work.)
+DROVIE_WEBHOOK_URL=""
+DROVIE_WEBHOOK_KEY=""
+
+# Rate limiting configuration
+MAX_REQUESTS_PER_WINDOW=35
+RATE_WINDOW_SECONDS=10
+RATE_LIMIT_DELAY=1
+
+# Retry configuration
+MAX_RETRIES=3
+RETRY_DELAY=5
+
+# Disk space configuration (in GB)
+MIN_FREE_SPACE_GB=5
+
+# rclone performance configuration
+RCLONE_TRANSFERS=4
+RCLONE_CHECKERS=8
+RCLONE_BUFFER_SIZE="64M"
+RCLONE_MULTI_THREADS=2
+RCLONE_MAX_CONCURRENT=1
+RCLONE_BWLIMIT="80M"
+
+# Live transfer progress. Each download publishes its state here while it runs,
+# which is what `putioctl progress` and the console's bars read; the files are
+# deleted as each transfer ends. Empty turns the feature off. The stats interval
+# is how often rclone updates those numbers, so it is both how fast a bar moves
+# and what the file costs (~700 bytes a tick, for the life of the transfer).
+# A value that isn't a duration (5s, 500ms, 2m) is refused with a warning and
+# falls back to 5s — a display setting must not be able to fail a download.
+PROGRESS_STATE_DIR="/tmp/putio_progress"
+RCLONE_STATS_INTERVAL="5s"
+
+# Logging level (DEBUG, INFO, WARN, ERROR)
+LOG_LEVEL="INFO"
+
+# Whether to delete files from Put.io after download (true/false)
+DELETE_AFTER_DOWNLOAD="true"
+
+# Stage downloads on local disk before copying to the final (often SMB)
+# destination. Insulates in-flight transfers from network mount drops; only
+# the final cp has to retry.
+USE_TEMP_DIR="true"
+
+# Durable staging directory used when USE_TEMP_DIR=true. Must be on local
+# storage with enough free space for the largest expected download. Avoid
+# /tmp — it is volatile (cleared on reboot) and on macOS lives on the boot
+# volume, which can fill up.
+STAGING_DIR="$HOME/.putio_staging"
+
+# Network share the libraries live on (optional). When MEDIA_MOUNT_POINT is
+# set, each file waits until the share is mounted and answering, so a dropped
+# NAS defers downloads instead of failing them. MEDIA_MOUNT_URL additionally
+# turns on automatic remounting, which is macOS-only (mount_smbfs, then
+# Finder). Leave both unset — the default — if the libraries are on local disk
+# or the host keeps the share mounted for you.
+#MEDIA_MOUNT_POINT="/Volumes/Media"
+#MEDIA_MOUNT_URL="smb://USERNAME@HOST._smb._tcp.local/Media"
+
+# --- Mount recovery (macOS, only with MEDIA_MOUNT_URL set) --------------
+# These settings exist to keep a dropped NAS quiet. Left to itself, every
+# failed remount asks Finder to open the share, and Finder answers with a
+# username/password dialog — several at once from the parallel download
+# jobs, and a fresh batch every 5 minutes from cron. The defaults below cap
+# that at zero dialogs when the NAS is simply gone, and at most two when it
+# is reachable but the saved password no longer works.
+
+# Hostname used for the reachability probe and for the silent mount_smbfs
+# attempt. Derived from MEDIA_MOUNT_URL by default, rewriting a Bonjour
+# service name (host._smb._tcp.local) to the plain mDNS host (host.local),
+# because only Finder can resolve the former. Set explicitly if your NAS is
+# reached by a name or IP that the URL doesn't reveal.
+#MEDIA_MOUNT_HOST="HOST.local"
+
+# TCP probe of the NAS before any remount is attempted. If this fails the
+# script does not touch Finder at all, which is what prevents the dialog
+# pile-up when the machine is off the network or the NAS is asleep.
+MOUNT_PROBE_PORT="445"
+MOUNT_PROBE_TIMEOUT="5"
+
+# Cooloff after a failed remount, doubling each consecutive failure up to
+# the max. Persisted in MEDIA_MOUNT_STATE_DIR so it spans cron runs rather
+# than resetting every 5 minutes. Only applies to remounts that failed with
+# the NAS answering; a cooloff earned while it was simply unreachable is
+# dropped as soon as it responds again, so recovery is not delayed.
+MOUNT_REMOUNT_BACKOFF_BASE="300"
+MOUNT_REMOUNT_BACKOFF_MAX="3600"
+
+# Finder is the only remount path that can raise a password prompt, so it is
+# tried only after the silent mount_smbfs path fails, and only this many
+# times consecutively. After that it is suppressed for the seconds below and
+# the log says what to reconnect by hand. Set ALLOW_GUI_REMOUNT="false" to
+# never involve Finder at all — recovery then depends entirely on
+# mount_smbfs plus the keychain.
+ALLOW_GUI_REMOUNT="true"
+MOUNT_GUI_MAX_FAILURES="2"
+MOUNT_GUI_SUPPRESS_SECONDS="21600"
+
+# Close an SMB auth dialog that our own remount attempt left on screen, by
+# killing NetAuthAgent (launchd restarts it on demand). Only fires after an
+# attempt this script made has already failed.
+MOUNT_DISMISS_AUTH_DIALOGS="true"
+
+# How long a process waits for another process's in-flight remount before
+# giving up and deferring its file. Must exceed a single remount's worst case
+# (~145s) so a slow-but-working recovery is not mistaken for a dead share.
+MOUNT_REMOUNT_WAIT_SECONDS="240"
+
+# Where the remount lock, failure counters and backoff timestamps live.
+MEDIA_MOUNT_STATE_DIR="/tmp/putio_mount_state"
+
+# --- pinned binaries -------------------------------------------------------
+# Optional. Left unset, each is discovered from the PATH (Homebrew first on a
+# Mac). Pin absolute paths if cron and your shell could resolve different
+# builds: with Homebrew after /usr/bin in the PATH, cron once ran
+# /usr/local/bin/rclone and Apple's /usr/bin/jq while a shell got the Homebrew
+# ones, and every transfer used a binary nobody had tested by hand.
+#RCLONE_CMD="/opt/homebrew/bin/rclone"
+#JQ_CMD="/opt/homebrew/bin/jq"
+
+# The interpreter for the components under putio/. Pin the VERSIONED Homebrew
+# formula (brew install python@3.13) — the unversioned `python` formula moves
+# to the next major release under you. Note that the versioned formula installs
+# no `python3` symlink into /opt/homebrew/bin at all, so leaving this unset
+# resolves Apple's /usr/bin/python3: 3.9.6, frozen, and past upstream EOL.
+# Unset is not fatal; it costs the features that need Python, not the sync.
+# Left unset, the newest of python3.13/3.12/3.11 in /opt/homebrew/bin,
+# /usr/local/bin, then /usr/bin/python3 is used (3.9 or later).
+#PYTHON_BIN="/opt/homebrew/bin/python3.13"
+
+# --- putioctl display ------------------------------------------------------
+# Read by putioctl only; the processor ignores it. When true, the single-line
+# "nothing to do" summary an idle cron run leaves is filtered out of
+# `putioctl logs` and the console's log pane — the lines stay in the log file
+# either way. Toggle it with `putioctl quiet` rather than editing by hand.
+LOGS_HIDE_IDLE="false"

@@ -1,0 +1,36 @@
+# Drovie Downloader on its own (Drovie elsewhere, or not at all).
+# If you run Drovie with its compose file, use its `downloader` profile instead.
+#
+#   cp docker/docker-compose.example.yml docker-compose.yml   # edit the paths
+#   docker compose up -d
+#   docker compose logs -f downloader
+
+services:
+  downloader:
+    image: ghcr.io/friedmad77/drovie-downloader:${DOWNLOADER_VERSION:-latest}
+    container_name: drovie-downloader
+    restart: unless-stopped
+    environment:
+      PUTIO_TOKEN: ${PUTIO_TOKEN:?Set PUTIO_TOKEN (put.io › Settings › API)}
+      TMDB_API_KEY: ${TMDB_API_KEY:?Set TMDB_API_KEY}
+      PLEX_TOKEN: ${PLEX_TOKEN:?Set PLEX_TOKEN}
+      PLEX_URL: ${PLEX_URL:-http://host.docker.internal:32400}
+      REMOTE: ${REMOTE:-putio:Drovie/}
+      SYNC_INTERVAL_MINUTES: ${SYNC_INTERVAL_MINUTES:-5}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-UTC}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - downloader-config:/config
+      - /path/to/downloads:/downloads
+      - /path/to/media/Movies:/media/Movies
+      - /path/to/media/TV:/media/TV
+    # Uncomment to read the status endpoint from another machine (it has no
+    # login of its own, so keep it on a trusted network).
+    # ports:
+    #   - "9494:9494"
+
+volumes:
+  downloader-config:

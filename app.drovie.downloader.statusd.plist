@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd job for the Drovie Downloader status service (putio-statusd).
+
+  __HOME__ is a placeholder: launchd does not expand ~ or $HOME in these paths.
+  Install with the sed in PUTIOCTL.md rather than editing this copy, so the
+  repo stays machine-independent.
+
+  KeepAlive is unconditional on purpose. The daemon holds no state, so a
+  restart costs nothing and loses nothing — the same reason the processor can
+  be killed at any instant. RunAtLoad brings it up on login.
+
+  It binds loopback only (the default in putio-statusd), because Drovie
+  runs on this same host and nothing off-box has any business reading it.
+
+  ProgramArguments names putio-statusd-run, not an interpreter: launchd cannot
+  read the config, so naming python here would be a second answer to "which
+  python", free to drift from the PYTHON_BIN the processor uses. The shim
+  resolves it from the config at launch and execs.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.drovie.downloader.statusd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/Scripts/putio-statusd-run</string>
+        <string>--putioctl</string>
+        <string>__HOME__/Scripts/putioctl</string>
+        <string>--script</string>
+        <string>__HOME__/Scripts/putio_download_and_delete.sh</string>
+        <string>--port</string>
+        <string>9494</string>
+        <string>--interval</string>
+        <string>2</string>
+        <string>--timeout</string>
+        <string>10</string>
+    </array>
+
+    <!--
+      launchd hands a job no PATH at all, and bash's built-in fallback when the
+      environment carries none is /usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:. —
+      no /sbin, no /usr/sbin. Anything putioctl shells out to by bare name that
+      lives there is simply not found, and a `cmd | grep -q` reads that silence
+      as a negative answer rather than an error: `mount` vanished here and
+      putio-statusd reported mount.ok false against a healthy share for as long
+      as nobody looked.
+
+      This is the same PATH, in the same order, that the processor exports for
+      itself - see the comment above that line in putio_download_and_delete.sh.
+      Setting one here REPLACES the fallback rather than adding to it, so a
+      narrower list would quietly drop /usr/local/bin and leave the daemon
+      resolving a different jq than the processor uses, or none at all. One
+      answer to "which binary", for cron and launchd alike.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Long enough that a crash loop backs off instead of spinning. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Scripts/putio-statusd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Scripts/putio-statusd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
